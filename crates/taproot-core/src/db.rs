@@ -159,7 +159,16 @@ fn row_to_json(row: &PgRow) -> Result<serde_json::Value> {
                 })
                 .map_err(|e| Error::Database(e.to_string()))?,
 
-            "TIMESTAMPTZ" | "TIMESTAMP" => row
+            "TIMESTAMPTZ" => row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(name)
+                .map(|v| {
+                    v.map_or(serde_json::Value::Null, |t| {
+                        serde_json::Value::String(t.to_rfc3339())
+                    })
+                })
+                .map_err(|e| Error::Database(e.to_string()))?,
+
+            "TIMESTAMP" => row
                 .try_get::<Option<chrono::NaiveDateTime>, _>(name)
                 .map(|v| {
                     v.map_or(serde_json::Value::Null, |t| {
