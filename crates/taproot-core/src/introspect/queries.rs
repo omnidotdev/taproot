@@ -131,7 +131,7 @@ async fn fetch_columns(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .is_empty()
-                && !row.get("column_default").map_or(true, serde_json::Value::is_null),
+                && !row.get("column_default").is_none_or(serde_json::Value::is_null),
             is_generated: str_field(row, "is_generated").unwrap_or_default() == "ALWAYS",
             is_array,
             comment: opt_str_field(row, "column_comment"),

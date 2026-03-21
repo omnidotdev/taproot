@@ -24,6 +24,7 @@ pub struct TableInfo {
 
 /// Metadata about a single column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -58,7 +59,7 @@ pub struct ForeignKey {
     pub foreign_columns: Vec<String>,
 }
 
-/// Metadata about a PostgreSQL enum type.
+/// Metadata about a Postgres enum type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumInfo {
     pub name: String,
@@ -66,7 +67,7 @@ pub struct EnumInfo {
     pub values: Vec<String>,
 }
 
-/// Metadata about a PostgreSQL composite type.
+/// Metadata about a Postgres composite type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeTypeInfo {
     pub name: String,

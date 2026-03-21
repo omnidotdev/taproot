@@ -20,14 +20,14 @@ pub trait Database: Send + Sync + 'static {
     async fn query_raw(&self, sql: &str) -> Result<Vec<JsonRow>>;
 }
 
-/// Database backend powered by sqlx with a PostgreSQL connection pool.
+/// Database backend powered by sqlx with a Postgres connection pool.
 #[derive(Debug, Clone)]
 pub struct SqlxBackend {
     pool: PgPool,
 }
 
 impl SqlxBackend {
-    /// Connect to a PostgreSQL database using the given URL.
+    /// Connect to a Postgres database using the given URL.
     ///
     /// # Errors
     /// Returns an error if the connection cannot be established.
@@ -38,13 +38,13 @@ impl SqlxBackend {
 
     /// Create a backend from an existing connection pool.
     #[must_use]
-    pub fn from_pool(pool: PgPool) -> Self {
+    pub const fn from_pool(pool: PgPool) -> Self {
         Self { pool }
     }
 
     /// Return a reference to the underlying connection pool.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 }
