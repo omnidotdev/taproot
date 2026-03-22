@@ -15,6 +15,41 @@ pub struct Config {
     /// `GraphQL` schema generation settings.
     #[serde(default)]
     pub schema: SchemaOptions,
+    /// Authentication / RLS settings.
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// Authentication / RLS configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Enable RLS passthrough.
+    #[serde(default)]
+    pub rls: bool,
+    /// JWT claim that determines the Postgres role.
+    #[serde(default = "default_role_claim")]
+    pub role_claim: String,
+    /// Postgres setting name for JWT claims.
+    #[serde(default = "default_claims_setting")]
+    pub claims_setting: String,
+    /// Default Postgres role when no JWT is present.
+    #[serde(default = "default_default_role")]
+    pub default_role: String,
+    /// JWT secret for HS256 verification (if set, tokens are verified; otherwise decoded without verification).
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            rls: false,
+            role_claim: default_role_claim(),
+            claims_setting: default_claims_setting(),
+            default_role: default_default_role(),
+            jwt_secret: None,
+        }
+    }
 }
 
 /// Database connection configuration.
@@ -90,4 +125,16 @@ fn default_listen() -> String {
 
 const fn default_playground() -> bool {
     true
+}
+
+fn default_role_claim() -> String {
+    "pg_role".into()
+}
+
+fn default_claims_setting() -> String {
+    "request.jwt.claims".into()
+}
+
+fn default_default_role() -> String {
+    "anonymous".into()
 }
