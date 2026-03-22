@@ -71,3 +71,37 @@ pub async fn execute_batch_lookup(
 
     Ok(grouped)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extract_lateral_from_row() {
+        let row = serde_json::json!({
+            "id": "user-1",
+            "name": "Alice",
+            "__lateral_posts": [
+                {"id": "post-1", "title": "Hello"},
+                {"id": "post-2", "title": "World"},
+            ]
+        });
+
+        let lateral = row.get("__lateral_posts");
+        assert!(lateral.is_some());
+        let arr = lateral.unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn lateral_empty_array_when_no_children() {
+        let row = serde_json::json!({
+            "id": "user-1",
+            "name": "Alice",
+            "__lateral_posts": []
+        });
+
+        let lateral = row.get("__lateral_posts");
+        assert!(lateral.is_some());
+        let arr = lateral.unwrap().as_array().unwrap();
+        assert!(arr.is_empty());
+    }
+}
