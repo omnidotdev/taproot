@@ -1452,3 +1452,48 @@ async fn has_many_via_lateral_join() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+#[tokio::test]
+async fn has_many_lateral_respects_pagination() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Add more posts for Alice
+    let extra_posts = format!(
+        "INSERT INTO \"{schema_name}\".posts (title, content, author_id, published) VALUES \
+         ('Post 2', 'Content 2', '00000000-0000-0000-0000-000000000001', true), \
+         ('Post 3', 'Content 3', '00000000-0000-0000-0000-000000000001', true)"
+    );
+    db.query_raw(&extra_posts)
+        .await
+        .expect("insert extra posts");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Request only first 2 posts
+    let result = gql_schema
+        .execute(
+            r"{ users(first: 10, orderBy: [NAME_ASC]) { edges { node { name postsByAuthorId(first: 2) { edges { node { title } } } } } } }",
+        )
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("should serialize");
+    let edges = data["users"]["edges"].as_array().expect("array");
+
+    // Find Alice (has 3 posts, should only get 2)
+    let alice = edges
+        .iter()
+        .find(|e| e["node"]["name"] == "Alice")
+        .expect("Alice");
+    let alice_posts = alice["node"]["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(alice_posts.len(), 2, "should respect first:2 pagination");
+
+    teardown_test_schema(&db, &schema_name).await;
+}

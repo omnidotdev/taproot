@@ -519,11 +519,41 @@ fn build_object_type(
                                     vec![]
                                 };
 
+                            // Apply client-side pagination
+                            #[allow(
+                                clippy::cast_sign_loss,
+                                clippy::cast_possible_truncation
+                            )]
+                            let first = ctx
+                                .args
+                                .try_get("first")
+                                .ok()
+                                .and_then(|v| v.i64().ok())
+                                .map(|n| n.max(0) as usize);
+
+                            let after = ctx
+                                .args
+                                .try_get("after")
+                                .ok()
+                                .and_then(|v| v.string().ok().map(str::to_owned));
+
+                            let offset = after
+                                .as_deref()
+                                .and_then(connection::decode_cursor)
+                                .map_or(0, |n| n + 1);
+                            let limit =
+                                first.unwrap_or(default_page_size).min(max_page_size);
+
                             #[allow(clippy::cast_possible_wrap)]
                             let total_count = all_rows.len() as i64;
-                            let offset = 0_usize;
+                            let rows: Vec<serde_json::Value> = all_rows
+                                .into_iter()
+                                .skip(offset)
+                                .take(limit)
+                                .collect();
+
                             let response = connection::build_connection_response(
-                                all_rows,
+                                rows,
                                 offset,
                                 total_count,
                             );
