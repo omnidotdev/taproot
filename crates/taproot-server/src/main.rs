@@ -99,10 +99,40 @@ async fn main() -> anyhow::Result<()> {
     );
 
     axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
 
+    tracing::info!("server stopped");
+
     Ok(())
+}
+
+/// Wait for a SIGTERM or SIGINT signal to initiate graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received, draining connections");
 }
 
 /// Background task that listens for Postgres NOTIFY events and broadcasts them
