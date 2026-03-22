@@ -12,6 +12,7 @@ base64.workspace = true
 async-trait.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
+lattice-execution = { path = "../../../../../lattice-stack/services/lattice/crates/lattice-execution", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -19,6 +20,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[features]
+default = []
+lattice = ["dep:lattice-execution"]
 
 [lints]
 workspace = true
