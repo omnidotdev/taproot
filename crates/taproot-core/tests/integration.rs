@@ -3277,3 +3277,241 @@ async fn nested_create_with_has_many_create() {
     assert!(bodies.contains(&"Comment 1"));
     assert!(bodies.contains(&"Comment 2"));
 }
+
+#[tokio::test]
+async fn nested_create_combined_belongs_to_and_has_many() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Full Nested Test"
+                content: "Both directions"
+                userByAuthorId: {
+                    create: { name: "NestedAuthor", email: "nested@test.com" }
+                }
+                commentsByPostId: {
+                    create: [
+                        { body: "Nested comment", authorId: "00000000-0000-0000-0000-000000000001" }
+                    ]
+                }
+            }) {
+                post {
+                    title
+                    userByAuthorId { name }
+                    commentsByPostId { edges { node { body } } }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "combined nested create errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let post = &data["createPost"]["post"];
+    assert_eq!(post["title"], "Full Nested Test");
+    assert_eq!(post["userByAuthorId"]["name"], "NestedAuthor");
+
+    let edges = post["commentsByPostId"]["edges"]
+        .as_array()
+        .expect("edges should be an array");
+    assert_eq!(edges.len(), 1, "should have 1 comment");
+    assert_eq!(edges[0]["node"]["body"], "Nested comment");
+}
+
+#[tokio::test]
+async fn nested_create_rolls_back_on_child_failure() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Count users before
+    let count_before = db
+        .query_raw(&format!(
+            "SELECT COUNT(*)::int AS cnt FROM \"{schema_name}\".users"
+        ))
+        .await
+        .expect("count query failed");
+    let user_count_before = count_before[0]["cnt"].as_i64().unwrap();
+
+    // Attempt to create a post with an inline author AND a comment with null
+    // body (body is NOT NULL), which should fail and roll back everything
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Should Rollback"
+                content: "Testing rollback"
+                userByAuthorId: {
+                    create: { name: "RollbackUser", email: "rollback@test.com" }
+                }
+                commentsByPostId: {
+                    create: [
+                        { authorId: "00000000-0000-0000-0000-000000000001" }
+                    ]
+                }
+            }) {
+                post { title }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    assert!(
+        !result.errors.is_empty(),
+        "mutation should fail due to missing required body"
+    );
+
+    // Verify rollback: user count should be unchanged
+    let count_after = db
+        .query_raw(&format!(
+            "SELECT COUNT(*)::int AS cnt FROM \"{schema_name}\".users"
+        ))
+        .await
+        .expect("count query failed");
+    let user_count_after = count_after[0]["cnt"].as_i64().unwrap();
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert_eq!(
+        user_count_before, user_count_after,
+        "user count should be unchanged after rollback (before={user_count_before}, after={user_count_after})"
+    );
+}
+
+#[tokio::test]
+async fn nested_create_connect_nonexistent_returns_error() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Bad Connect"
+                content: "Testing"
+                userByAuthorId: {
+                    connect: { id: "ffffffff-ffff-ffff-ffff-ffffffffffff" }
+                }
+            }) {
+                post { title }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        !result.errors.is_empty(),
+        "connecting to nonexistent record should fail"
+    );
+
+    let error_msg = result.errors[0].message.to_lowercase();
+    assert!(
+        error_msg.contains("record not found"),
+        "error should mention 'record not found', got: {error_msg}"
+    );
+}
+
+#[tokio::test]
+async fn nested_mutation_respects_omit_create_on_related_table() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Add @omit(create) to the users table
+    db.query_raw(&format!(
+        "COMMENT ON TABLE \"{schema_name}\".users IS E'@omit(create)'"
+    ))
+    .await
+    .unwrap();
+
+    // Re-introspect and rebuild the schema with the new comment
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let sdl = gql_schema.sdl();
+
+    // PostUserByAuthorIdInput should still exist (for connect)
+    assert!(
+        sdl.contains("PostUserByAuthorIdInput"),
+        "PostUserByAuthorIdInput should exist for connect-only"
+    );
+
+    // Introspect PostUserByAuthorIdInput to verify it has connect but NOT create
+    let query = r#"
+        {
+            __type(name: "PostUserByAuthorIdInput") {
+                inputFields { name }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+    assert!(result.errors.is_empty(), "introspection errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields should be an array");
+
+    let field_names: Vec<&str> = fields
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+
+    assert!(
+        field_names.contains(&"connect"),
+        "PostUserByAuthorIdInput should have connect field"
+    );
+    assert!(
+        !field_names.contains(&"create"),
+        "PostUserByAuthorIdInput should NOT have create field when related table has @omit(create)"
+    );
+
+    // CreateUserInput should not exist since users has @omit(create)
+    assert!(
+        !sdl.contains("CreateUserInput"),
+        "CreateUserInput should not exist when users has @omit(create)"
+    );
+
+    // Has-many nested inputs from users should also be suppressed:
+    // CreatePostInput should NOT have a has-many nested field for users
+    // (users table has @omit(create), so it won't have CreateUserInput
+    // to nest into anyway, but the PostCommentsByPostIdInput should still exist)
+    assert!(
+        sdl.contains("PostCommentsByPostIdInput"),
+        "PostCommentsByPostIdInput should still exist (comments not omitted)"
+    );
+
+    teardown_test_schema(&db, &schema_name).await;
+}

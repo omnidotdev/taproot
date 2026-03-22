@@ -57,20 +57,26 @@ pub enum NestedRelDirection {
 /// Build a nested belongs-to input type with `create` and `connect` fields.
 ///
 /// For example, `PostUserByAuthorIdInput` has:
-/// - `create: CreateUserInput` (optional)
+/// - `create: CreateUserInput` (optional, excluded when `omit_create` is true)
 /// - `connect: PostUserByAuthorIdConnectInput` (optional)
+///
+/// When the related table has `@omit(create)`, pass `omit_create: true` to
+/// exclude the `create` field, leaving only `connect`.
 #[must_use]
 pub fn build_nested_belongs_to_input(
     container_type_name: &str,
     related_create_input: &str,
     connect_input_name: &str,
+    omit_create: bool,
 ) -> InputObject {
     let mut input = InputObject::new(container_type_name);
 
-    input = input.field(InputValue::new(
-        "create",
-        TypeRef::named(related_create_input),
-    ));
+    if !omit_create {
+        input = input.field(InputValue::new(
+            "create",
+            TypeRef::named(related_create_input),
+        ));
+    }
 
     input = input.field(InputValue::new(
         "connect",

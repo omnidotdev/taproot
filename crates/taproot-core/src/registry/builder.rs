@@ -2063,11 +2063,18 @@ fn build_nested_rel_inputs(
         schema_builder = schema_builder.register(
             mutations::build_nested_connect_input(&connect_name, &related_pk_cols, enum_names),
         );
+        // Check if the related table has @omit(create)
+        let related_omit_create = related_table
+            .tags
+            .get("omit")
+            .is_some_and(|v| v.contains("create"));
+
         schema_builder = schema_builder.register(
             mutations::build_nested_belongs_to_input(
                 &container_name,
                 &related_create_input,
                 &connect_name,
+                related_omit_create,
             ),
         );
 
@@ -2101,6 +2108,15 @@ fn build_nested_rel_inputs(
             }
 
             if fk.foreign_table != table.name || fk.foreign_schema != table.schema {
+                continue;
+            }
+
+            // Skip has-many nested input when the child table has @omit(create)
+            let child_omit_create = other_table
+                .tags
+                .get("omit")
+                .is_some_and(|v| v.contains("create"));
+            if child_omit_create {
                 continue;
             }
 
