@@ -97,7 +97,14 @@ fn bind_json_param<'q>(
                 query.bind(n.to_string())
             }
         }
-        serde_json::Value::String(s) => query.bind(s.as_str()),
+        serde_json::Value::String(s) => {
+            // Try UUID first — Postgres requires typed UUID params
+            if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                query.bind(uuid)
+            } else {
+                query.bind(s.as_str())
+            }
+        }
         // Arrays and objects are bound as JSON
         other => query.bind(other.clone()),
     }
