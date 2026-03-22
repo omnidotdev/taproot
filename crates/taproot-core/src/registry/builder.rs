@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
 use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
+use crate::subscription::ChangeBroadcaster;
 
 use super::federation;
 use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
@@ -68,6 +69,7 @@ pub fn build_schema(
     db: &Arc<dyn Database>,
     options: &SchemaOptions,
     plugins: &[Arc<dyn Plugin>],
+    broadcaster: Option<&ChangeBroadcaster>,
 ) -> Result<Schema> {
     // Clone schemas so plugins can mutate them
     let mut schemas = schemas.to_vec();
@@ -96,11 +98,20 @@ pub fn build_schema(
     let mut enum_names: HashSet<String> = HashSet::new();
     let mut mutation = Object::new("Mutation");
     let mut has_mutations = false;
-    let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
+    let subscription_type = if options.subscriptions {
+        Some("Subscription")
+    } else {
+        None
+    };
+    let mut schema_builder = Schema::build("Query", Some("Mutation"), subscription_type);
     schema_builder = schema_builder.data(plugin_store);
 
     let loader_registry = LoaderRegistry::new(Arc::clone(db), None);
     schema_builder = schema_builder.data(loader_registry);
+
+    if let Some(broadcaster) = broadcaster {
+        schema_builder = schema_builder.data(broadcaster.clone());
+    }
 
     // Collect all tables across schemas for relationship resolution
     let all_tables: Vec<&TableInfo> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
@@ -254,6 +265,98 @@ pub fn build_schema(
         ));
     }
     schema_builder = schema_builder.register(mutation);
+
+    if options.subscriptions && broadcaster.is_some() {
+        use async_graphql::dynamic::{Subscription, SubscriptionField, SubscriptionFieldFuture};
+
+        let mut subscription = Subscription::new("Subscription");
+
+        for introspected in &schemas {
+            for table in &introspected.tables {
+                let type_name = to_pascal_case(&singularize(&table.name));
+
+                // Only tables with single-column PK
+                let Some(pk) = &table.primary_key else {
+                    continue;
+                };
+                if pk.columns.len() != 1 {
+                    continue;
+                }
+
+                let field_name = format!("on{type_name}Changed");
+                let schema_name = table.schema.clone();
+                let table_name = table.name.clone();
+                let pk_col = pk.columns[0].clone();
+                let db_for_sub = Arc::clone(db);
+
+                let sub_field = SubscriptionField::new(
+                    &field_name,
+                    TypeRef::named(&type_name),
+                    move |ctx| {
+                        let db = Arc::clone(&db_for_sub);
+                        let schema_name = schema_name.clone();
+                        let table_name = table_name.clone();
+                        let pk_col = pk_col.clone();
+
+                        SubscriptionFieldFuture::new(async move {
+                            let broadcaster =
+                                ctx.data::<ChangeBroadcaster>().map_err(|_| {
+                                    async_graphql::Error::new(
+                                        "subscription broadcaster not available",
+                                    )
+                                })?;
+
+                            let mut rx = broadcaster.subscribe();
+
+                            let stream = async_stream::stream! {
+                                while let Ok(notif) = rx.recv().await {
+                                    if notif.table != table_name {
+                                        continue;
+                                    }
+
+                                    let rls = ctx.data::<RlsContext>().ok();
+
+                                    let plan = PlanNode::Scan {
+                                        schema: schema_name.clone(),
+                                        table: table_name.clone(),
+                                        filter: Some(FilterExpr::Eq {
+                                            column: pk_col.clone(),
+                                            value: serde_json::json!(notif.id),
+                                        }),
+                                        order_by: None,
+                                        limit: Some(1),
+                                        offset: None,
+                                        selections: vec![],
+                                    };
+
+                                    match execute_plan(&plan, &db, rls).await {
+                                        Ok(rows) => {
+                                            if let Some(row) = rows.into_iter().next() {
+                                                yield Ok(FieldValue::value(
+                                                    serde_json_to_gql_value(&row),
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            yield Err(async_graphql::Error::new(format!(
+                                                "subscription fetch error: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            };
+
+                            Ok(stream)
+                        })
+                    },
+                );
+
+                subscription = subscription.field(sub_field);
+            }
+        }
+
+        schema_builder = schema_builder.register(subscription);
+    }
 
     if options.federation {
         schema_builder = schema_builder.enable_federation();

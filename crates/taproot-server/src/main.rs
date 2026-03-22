@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     info!(table_count, "introspection complete");
 
     // Build GraphQL schema
-    let gql_schema = build_schema(&schemas, &db, &cfg.schema, &[])
+    let gql_schema = build_schema(&schemas, &db, &cfg.schema, &[], None)
         .context("failed to build GraphQL schema")?;
 
     // Build and start server

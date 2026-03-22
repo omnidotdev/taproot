@@ -129,7 +129,7 @@ async fn build_test_schema(
     let db_arc: Arc<dyn Database> = Arc::new(db.clone());
     let schema_opts = SchemaOptions::default();
 
-    build_schema(&introspected, &db_arc, &schema_opts, &[]).expect("schema build failed")
+    build_schema(&introspected, &db_arc, &schema_opts, &[], None).expect("schema build failed")
 }
 
 #[tokio::test]
@@ -873,7 +873,7 @@ async fn plugin_filters_tables() {
 
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OmitPosts)];
     let schema =
-        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins).unwrap();
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins, None).unwrap();
     let sdl = schema.sdl();
 
     teardown_test_schema(&db, &schema_name).await;
@@ -1156,7 +1156,7 @@ async fn on_plan_hook_filters_real_graphql_queries() {
     let db_arc: Arc<dyn Database> = Arc::new(db.clone());
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OnlyAliceQueryPlugin)];
     let gql_schema =
-        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins).unwrap();
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins, None).unwrap();
 
     // List query should return only Alice
     let list_result = gql_schema
@@ -1293,6 +1293,7 @@ async fn has_many_with_on_plan_hook() {
         &db_arc,
         &SchemaOptions::default(),
         &plugins,
+        None,
     )
     .expect("schema build should succeed");
 
@@ -1342,7 +1343,7 @@ async fn federation_sdl_contains_key_directives() {
     };
 
     let gql_schema =
-        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+        build_schema(&introspected, &db_arc, &options, &[], None).expect("schema build should succeed");
 
     let sdl = gql_schema
         .sdl_with_options(async_graphql::SDLExportOptions::new().federation());
@@ -1380,7 +1381,7 @@ async fn federation_entities_resolves_by_key() {
     };
 
     let gql_schema =
-        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+        build_schema(&introspected, &db_arc, &options, &[], None).expect("schema build should succeed");
 
     // Resolve Alice by her entity key
     let query = r#"
@@ -1437,7 +1438,7 @@ async fn federation_entities_resolves_multiple() {
     };
 
     let gql_schema =
-        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+        build_schema(&introspected, &db_arc, &options, &[], None).expect("schema build should succeed");
 
     // Resolve both Alice and Bob in a single _entities call
     let query = r#"
@@ -1585,7 +1586,7 @@ async fn on_plan_hooks_apply_to_lateral_joins() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PublishedOnlyPlugin)];
 
     let gql_schema =
-        build_schema(&introspected, &db_arc, &options, &plugins).expect("schema build");
+        build_schema(&introspected, &db_arc, &options, &plugins, None).expect("schema build");
 
     // Query users with posts — plugin should filter to published only
     let result = gql_schema
@@ -1758,7 +1759,7 @@ async fn rls_filters_rows_by_context() {
 
     let db_arc: Arc<dyn Database> = Arc::new(db.clone());
     let gql_schema =
-        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &[]).expect("schema build");
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &[], None).expect("schema build");
 
     // Query as Alice — should only see Alice's row
     let rls_ctx = RlsContext {
