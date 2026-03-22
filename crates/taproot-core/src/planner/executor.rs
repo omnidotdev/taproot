@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::db::Database;
+use crate::db::{Database, RlsContext};
 use crate::error::Result;
 
 use super::compile::{compile_plan, compile_plan_count};
@@ -14,12 +14,13 @@ use super::plan::PlanNode;
 pub async fn execute_plan(
     plan: &PlanNode,
     db: &Arc<dyn Database>,
+    rls: Option<&RlsContext>,
 ) -> Result<Vec<serde_json::Value>> {
     let (sql, params) = compile_plan(plan);
     if sql.is_empty() {
         return Ok(vec![]);
     }
-    let rows = db.query(&sql, &params).await?;
+    let rows = db.query_with_rls(&sql, &params, rls).await?;
 
     // Unwrap `row_to_json` wrappers produced by `SELECT row_to_json(t.*)`
     Ok(rows
@@ -39,12 +40,13 @@ pub async fn execute_plan(
 pub async fn execute_plan_count(
     plan: &PlanNode,
     db: &Arc<dyn Database>,
+    rls: Option<&RlsContext>,
 ) -> Result<i64> {
     let (sql, params) = compile_plan_count(plan);
     if sql.is_empty() {
         return Ok(0);
     }
-    let rows = db.query(&sql, &params).await?;
+    let rows = db.query_with_rls(&sql, &params, rls).await?;
     let count = rows
         .first()
         .and_then(|row| row.get("count"))
@@ -60,12 +62,13 @@ pub async fn execute_plan_count(
 pub async fn execute_batch_lookup(
     plan: &PlanNode,
     db: &Arc<dyn Database>,
+    rls: Option<&RlsContext>,
 ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
     let PlanNode::BatchLookup { key_column, .. } = plan else {
         return Ok(HashMap::new());
     };
 
-    let rows = execute_plan(plan, db).await?;
+    let rows = execute_plan(plan, db, rls).await?;
     let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
     for row in rows {

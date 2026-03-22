@@ -905,7 +905,7 @@ async fn plan_scan_all_users() {
         selections: vec![],
     };
 
-    let rows = execute_plan(&plan, &db_arc)
+    let rows = execute_plan(&plan, &db_arc, None)
         .await
         .expect("scan should succeed");
     assert_eq!(rows.len(), 2, "should find both seeded users");
@@ -936,7 +936,7 @@ async fn plan_scan_with_filter() {
         selections: vec![],
     };
 
-    let rows = execute_plan(&plan, &db_arc)
+    let rows = execute_plan(&plan, &db_arc, None)
         .await
         .expect("scan should succeed");
     assert_eq!(rows.len(), 1);
@@ -965,7 +965,7 @@ async fn plan_scan_count() {
         selections: vec![],
     };
 
-    let count = execute_plan_count(&plan, &db_arc)
+    let count = execute_plan_count(&plan, &db_arc, None)
         .await
         .expect("count should succeed");
     assert_eq!(count, 2, "should count both seeded posts");
@@ -995,7 +995,7 @@ async fn plan_batch_lookup() {
         selections: vec![],
     };
 
-    let grouped = execute_batch_lookup(&batch_plan, &db_arc)
+    let grouped = execute_batch_lookup(&batch_plan, &db_arc, None)
         .await
         .expect("batch lookup should succeed");
     assert_eq!(grouped.len(), 2, "should have 2 groups (one per user)");
@@ -1027,7 +1027,7 @@ async fn plan_scan_with_pagination() {
         selections: vec![],
     };
 
-    let page1 = execute_plan(&plan, &db_arc)
+    let page1 = execute_plan(&plan, &db_arc, None)
         .await
         .expect("scan should succeed");
     assert_eq!(page1.len(), 1, "page 1 should have 1 row");
@@ -1047,7 +1047,7 @@ async fn plan_scan_with_pagination() {
         selections: vec![],
     };
 
-    let page2 = execute_plan(&plan_p2, &db_arc)
+    let page2 = execute_plan(&plan_p2, &db_arc, None)
         .await
         .expect("scan should succeed");
     assert_eq!(page2.len(), 1, "page 2 should have 1 row");
@@ -1104,7 +1104,7 @@ async fn plan_with_plugin_on_plan_hook() {
     let plugin = OnlyAlicePlugin;
     plugin.on_plan(&mut plan);
 
-    let rows = execute_plan(&plan, &db_arc)
+    let rows = execute_plan(&plan, &db_arc, None)
         .await
         .expect("scan should succeed");
     assert_eq!(rows.len(), 1, "plugin should filter to only Alice");

@@ -5,7 +5,7 @@ use async_graphql::dynamic::{
     Enum, EnumItem, Field, FieldFuture, FieldValue, InputValue, Object, Scalar, Schema, TypeRef,
 };
 
-use crate::db::Database;
+use crate::db::{Database, RlsContext};
 use crate::error::{Error, Result};
 use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
 use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
@@ -99,7 +99,7 @@ pub fn build_schema(
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(plugin_store);
 
-    let loader_registry = LoaderRegistry::new(Arc::clone(db));
+    let loader_registry = LoaderRegistry::new(Arc::clone(db), None);
     schema_builder = schema_builder.data(loader_registry);
 
     // Collect all tables across schemas for relationship resolution
@@ -266,6 +266,7 @@ pub fn build_schema(
             let db = Arc::clone(&db_for_entities);
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let representations = ctx.args.try_get("representations")?.list()?;
                 let mut values = Vec::new();
 
@@ -322,7 +323,7 @@ pub fn build_schema(
                         }
                     }
 
-                    let rows = execute_plan(&plan, &db).await.map_err(|e| {
+                    let rows = execute_plan(&plan, &db, rls).await.map_err(|e| {
                         async_graphql::Error::new(format!("database error: {e}"))
                     })?;
 
@@ -513,6 +514,7 @@ fn build_object_type(
                     let parent_pk_col = parent_pk_col.clone();
 
                     FieldFuture::new(async move {
+                        let rls = ctx.data::<RlsContext>().ok();
                         let parent = ctx.parent_value.try_to_value()?;
 
                         // Check for lateral join data first
@@ -635,13 +637,13 @@ fn build_object_type(
 
                         apply_on_plan_hooks(&ctx, &mut count_plan);
 
-                        let total_count = execute_plan_count(&count_plan, &db)
+                        let total_count = execute_plan_count(&count_plan, &db, rls)
                             .await
                             .map_err(|e| {
                                 async_graphql::Error::new(format!("database error: {e}"))
                             })?;
 
-                        let rows = execute_plan(&data_plan, &db)
+                        let rows = execute_plan(&data_plan, &db, rls)
                             .await
                             .map_err(|e| {
                                 async_graphql::Error::new(format!("database error: {e}"))
@@ -711,6 +713,7 @@ fn build_singular_query(
             let arg_name = arg_name.clone();
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let pk_value = ctx.args.try_get(&arg_name)?;
                 let pk_json = value_accessor_to_json(&pk_value);
 
@@ -729,7 +732,7 @@ fn build_singular_query(
 
                 apply_on_plan_hooks(&ctx, &mut plan);
 
-                let rows = execute_plan(&plan, &db).await.map_err(|e| {
+                let rows = execute_plan(&plan, &db, rls).await.map_err(|e| {
                     async_graphql::Error::new(format!("database error: {e}"))
                 })?;
 
@@ -789,6 +792,7 @@ fn build_unique_query(
         let arg_names = arg_names.clone();
 
         FieldFuture::new(async move {
+            let rls = ctx.data::<RlsContext>().ok();
             let mut filter_parts = Vec::with_capacity(constraint_columns.len());
             for (col_name, arg_name) in constraint_columns.iter().zip(&arg_names) {
                 let arg_value = ctx.args.try_get(arg_name)?;
@@ -817,7 +821,7 @@ fn build_unique_query(
 
             apply_on_plan_hooks(&ctx, &mut plan);
 
-            let rows = execute_plan(&plan, &db).await.map_err(|e| {
+            let rows = execute_plan(&plan, &db, rls).await.map_err(|e| {
                 async_graphql::Error::new(format!("database error: {e}"))
             })?;
 
@@ -921,6 +925,7 @@ fn build_list_query(
             let all_tables_for_lateral = all_tables_for_lateral.clone();
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let condition_json = extract_json_arg(&ctx, "condition");
                 let order_json = extract_json_arg(&ctx, "orderBy");
 
@@ -987,11 +992,11 @@ fn build_list_query(
 
                 apply_on_plan_hooks(&ctx, &mut count_plan);
 
-                let total_count = execute_plan_count(&count_plan, &db)
+                let total_count = execute_plan_count(&count_plan, &db, rls)
                     .await
                     .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
 
-                let rows = execute_plan(&data_plan, &db)
+                let rows = execute_plan(&data_plan, &db, rls)
                     .await
                     .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
 
@@ -1367,6 +1372,7 @@ fn build_create_mutation(
             let table_field = table_field.clone();
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let input_value = ctx.args.try_get("input")?;
                 let input_json = gql_value_to_json(input_value.as_value());
 
@@ -1378,7 +1384,7 @@ fn build_create_mutation(
                 let (sql, params) =
                     mutations::create_to_sql(&input_json, &table_info, &schema_name);
 
-                let rows = db.query(&sql, &params).await.map_err(|e| {
+                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
                     async_graphql::Error::new(format!("database error: {e}"))
                 })?;
 
@@ -1435,6 +1441,7 @@ fn build_update_mutation(
             let pk_field_name = pk_field_name.clone();
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let input_value = ctx.args.try_get("input")?;
                 let input_json = gql_value_to_json(input_value.as_value());
 
@@ -1461,7 +1468,7 @@ fn build_update_mutation(
                     &schema_name,
                 );
 
-                let rows = db.query(&sql, &params).await.map_err(|e| {
+                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
                     async_graphql::Error::new(format!("database error: {e}"))
                 })?;
 
@@ -1517,6 +1524,7 @@ fn build_delete_mutation(
             let pk_field_name = pk_field_name.clone();
 
             FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
                 let input_value = ctx.args.try_get("input")?;
                 let input_json = gql_value_to_json(input_value.as_value());
 
@@ -1537,7 +1545,7 @@ fn build_delete_mutation(
                     &schema_name,
                 );
 
-                let rows = db.query(&sql, &params).await.map_err(|e| {
+                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
                     async_graphql::Error::new(format!("database error: {e}"))
                 })?;
 

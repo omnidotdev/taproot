@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_graphql::dataloader::{DataLoader, Loader};
 
-use crate::db::Database;
+use crate::db::{Database, RlsContext};
 use crate::planner::{execute_batch_lookup, PlanNode};
 
 /// Key identifying a specific belongs-to relationship loader
@@ -41,16 +41,24 @@ pub struct BelongsToLoader {
     schema: String,
     table: String,
     key_column: String,
+    rls: Option<RlsContext>,
 }
 
 impl BelongsToLoader {
     #[must_use]
-    pub fn new(db: Arc<dyn Database>, schema: String, table: String, key_column: String) -> Self {
+    pub fn new(
+        db: Arc<dyn Database>,
+        schema: String,
+        table: String,
+        key_column: String,
+        rls: Option<RlsContext>,
+    ) -> Self {
         Self {
             db,
             schema,
             table,
             key_column,
+            rls,
         }
     }
 }
@@ -72,7 +80,7 @@ impl Loader<String> for BelongsToLoader {
             selections: vec![],
         };
 
-        let grouped = execute_batch_lookup(&plan, &self.db)
+        let grouped = execute_batch_lookup(&plan, &self.db, self.rls.as_ref())
             .await
             .map_err(|e| Arc::new(async_graphql::Error::new(format!("database error: {e}"))))?;
 
@@ -93,14 +101,16 @@ impl Loader<String> for BelongsToLoader {
 #[derive(Clone)]
 pub struct LoaderRegistry {
     db: Arc<dyn Database>,
+    rls: Option<RlsContext>,
     loaders: Arc<Mutex<HashMap<LoaderKey, Arc<DataLoader<BelongsToLoader>>>>>,
 }
 
 impl LoaderRegistry {
     #[must_use]
-    pub fn new(db: Arc<dyn Database>) -> Self {
+    pub fn new(db: Arc<dyn Database>, rls: Option<RlsContext>) -> Self {
         Self {
             db,
+            rls,
             loaders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -121,6 +131,7 @@ impl LoaderRegistry {
             key.schema.clone(),
             key.table.clone(),
             key.key_column.clone(),
+            self.rls.clone(),
         );
 
         let data_loader = Arc::new(DataLoader::new(loader, tokio::spawn));
