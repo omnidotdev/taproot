@@ -4,6 +4,84 @@ use sqlx::{Column, Row, TypeInfo};
 
 use crate::error::{Error, Result};
 
+/// Trait-object safe interface for executing operations within a database transaction.
+#[async_trait]
+pub trait TransactionOps: Send {
+    /// Execute a parameterized query within the transaction and return rows as JSON.
+    async fn query(&mut self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<JsonRow>>;
+
+    /// Commit the transaction.
+    async fn commit(self: Box<Self>) -> Result<()>;
+
+    /// Roll back the transaction.
+    async fn rollback(self: Box<Self>) -> Result<()>;
+
+    /// Apply RLS context (SET LOCAL) within the transaction.
+    async fn set_rls(&mut self, rls: &RlsContext) -> Result<()>;
+}
+
+/// Transaction wrapper around a sqlx Postgres transaction.
+pub struct SqlxTransaction {
+    tx: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl SqlxTransaction {
+    fn tx_mut(&mut self) -> Result<&mut sqlx::Transaction<'static, sqlx::Postgres>> {
+        self.tx
+            .as_mut()
+            .ok_or_else(|| Error::Database("transaction already consumed".into()))
+    }
+
+    fn take_tx(&mut self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        self.tx
+            .take()
+            .ok_or_else(|| Error::Database("transaction already consumed".into()))
+    }
+}
+
+#[async_trait]
+impl TransactionOps for SqlxTransaction {
+    async fn query(&mut self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<JsonRow>> {
+        let tx = self.tx_mut()?;
+        let mut query = sqlx::query(sql);
+
+        for param in params {
+            query = bind_json_param(query, param);
+        }
+
+        let rows = query.fetch_all(&mut **tx).await?;
+        rows.iter().map(row_to_json).collect()
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<()> {
+        let tx = self.take_tx()?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Database(e.to_string()))
+    }
+
+    async fn rollback(mut self: Box<Self>) -> Result<()> {
+        let tx = self.take_tx()?;
+        tx.rollback()
+            .await
+            .map_err(|e| Error::Database(e.to_string()))
+    }
+
+    async fn set_rls(&mut self, rls: &RlsContext) -> Result<()> {
+        let stmts = rls.set_local_statements();
+        let tx = self.tx_mut()?;
+
+        for stmt in &stmts {
+            sqlx::query(stmt)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A database row represented as a JSON object.
 pub type JsonRow = serde_json::Value;
 
@@ -62,6 +140,14 @@ pub trait Database: Send + Sync + 'static {
 
     /// Execute a raw query with no parameters (used for introspection).
     async fn query_raw(&self, sql: &str) -> Result<Vec<JsonRow>>;
+
+    /// Begin a new database transaction.
+    ///
+    /// # Errors
+    /// Returns an error if transactions are not supported by the backend.
+    async fn begin(&self) -> Result<Box<dyn TransactionOps>> {
+        Err(Error::Database("transactions not supported".into()))
+    }
 
     /// Execute a query within a transaction that has RLS context set via SET LOCAL.
     /// Falls back to regular query if rls is None or has no statements.
@@ -132,6 +218,11 @@ impl Database for SqlxBackend {
     async fn query_raw(&self, sql: &str) -> Result<Vec<JsonRow>> {
         let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         rows.iter().map(row_to_json).collect()
+    }
+
+    async fn begin(&self) -> Result<Box<dyn TransactionOps>> {
+        let tx = self.pool.begin().await?;
+        Ok(Box::new(SqlxTransaction { tx: Some(tx) }))
     }
 
     async fn query_with_rls(
@@ -295,9 +386,7 @@ fn row_to_json(row: &PgRow) -> Result<serde_json::Value> {
             // Fall back to string representation for all other types
             _ => row
                 .try_get::<Option<String>, _>(name)
-                .map(|v| {
-                    v.map_or(serde_json::Value::Null, serde_json::Value::String)
-                })
+                .map(|v| v.map_or(serde_json::Value::Null, serde_json::Value::String))
                 .map_err(|e| Error::Database(e.to_string()))?,
         };
 
@@ -348,6 +437,132 @@ mod tests {
         let ctx = RlsContext::default();
         let stmts = ctx.set_local_statements();
         assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn default_begin_returns_error() {
+        // Verify the default `begin()` impl returns an error for backends
+        // that don't support transactions
+        struct NoTxBackend;
+
+        #[async_trait]
+        impl Database for NoTxBackend {
+            async fn query(
+                &self,
+                _sql: &str,
+                _params: &[serde_json::Value],
+            ) -> Result<Vec<JsonRow>> {
+                Ok(vec![])
+            }
+            async fn execute(&self, _sql: &str, _params: &[serde_json::Value]) -> Result<u64> {
+                Ok(0)
+            }
+            async fn query_raw(&self, _sql: &str) -> Result<Vec<JsonRow>> {
+                Ok(vec![])
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = NoTxBackend;
+            let result = db.begin().await;
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.to_string().contains("not supported"),
+                "default begin() should return 'not supported' error"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn transaction_commit_persists() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+
+        let backend = SqlxBackend::connect(&url).await.unwrap();
+
+        // Create a temp table
+        backend
+            .query_raw(
+                "CREATE TEMPORARY TABLE _taproot_tx_test (id serial PRIMARY KEY, val text) ON COMMIT DROP",
+            )
+            .await
+            .unwrap();
+
+        // Actually we need a table that survives commits, use a unique name
+        let table = format!("_taproot_tx_commit_{}", std::process::id());
+        backend
+            .query_raw(&format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id serial PRIMARY KEY, val text)"
+            ))
+            .await
+            .unwrap();
+
+        // Insert within a transaction and commit
+        let mut tx = backend.begin().await.unwrap();
+        tx.query(
+            &format!("INSERT INTO {table} (val) VALUES ($1)"),
+            &[serde_json::Value::String("committed".into())],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // Verify data persisted
+        let rows = backend
+            .query_raw(&format!("SELECT val FROM {table}"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["val"], "committed");
+
+        // Cleanup
+        backend
+            .query_raw(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_rollback_discards() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+
+        let backend = SqlxBackend::connect(&url).await.unwrap();
+
+        let table = format!("_taproot_tx_rollback_{}", std::process::id());
+        backend
+            .query_raw(&format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id serial PRIMARY KEY, val text)"
+            ))
+            .await
+            .unwrap();
+
+        // Insert within a transaction and rollback
+        let mut tx = backend.begin().await.unwrap();
+        tx.query(
+            &format!("INSERT INTO {table} (val) VALUES ($1)"),
+            &[serde_json::Value::String("rolled_back".into())],
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        // Verify data was not persisted
+        let rows = backend
+            .query_raw(&format!("SELECT val FROM {table}"))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "rollback should discard inserts");
+
+        // Cleanup
+        backend
+            .query_raw(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .unwrap();
     }
 
     #[test]
