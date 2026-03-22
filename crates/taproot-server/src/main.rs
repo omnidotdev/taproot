@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to build GraphQL schema")?;
 
     // Build and start server
-    let router = server::build_router(gql_schema, &cfg.server);
+    let router = server::build_router(gql_schema, &cfg.server, &cfg.auth);
 
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen)
         .await
