@@ -2894,3 +2894,83 @@ async fn setof_scalar_function_as_root_query() {
     assert_eq!(names[0], "Alice");
     assert_eq!(names[1], "Bob");
 }
+
+#[tokio::test]
+async fn volatile_function_as_custom_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a VOLATILE function — should appear as a mutation field
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".increment_counter() \
+         RETURNS integer AS $$ \
+           SELECT 42 \
+         $$ LANGUAGE sql VOLATILE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r"
+        mutation {
+            incrementCounter
+        }
+    ";
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "volatile function mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    assert_eq!(data["incrementCounter"], 42);
+}
+
+#[tokio::test]
+async fn stable_function_not_on_mutations() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a STABLE function — should NOT appear as a mutation field
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".add_numbers(a integer, b integer) \
+         RETURNS integer AS $$ \
+           SELECT a + b \
+         $$ LANGUAGE sql STABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r"
+        mutation {
+            addNumbers(a: 1, b: 2)
+        }
+    ";
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        !result.errors.is_empty(),
+        "stable function should not be exposed as a mutation field"
+    );
+}

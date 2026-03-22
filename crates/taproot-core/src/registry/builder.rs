@@ -329,6 +329,30 @@ pub fn build_schema(
         }
     }
 
+    // Expose non-computed VOLATILE SQL functions as root mutation fields
+    for introspected in &schemas {
+        for func in &introspected.functions {
+            // Skip computed fields — they are already registered on their parent type
+            if func.computed_table.is_some() {
+                continue;
+            }
+
+            // Only expose VOLATILE functions as mutations
+            if func.volatility != 'v' {
+                continue;
+            }
+
+            has_mutations = true;
+            let field = build_custom_function_query(
+                func,
+                &table_names,
+                db,
+                options,
+            );
+            mutation = mutation.field(field);
+        }
+    }
+
     schema_builder = schema_builder.register(query);
 
     if !has_mutations {
