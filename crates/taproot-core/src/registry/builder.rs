@@ -190,8 +190,19 @@ pub fn build_schema(
                 query = query.field(field);
             }
 
-            // List query (returns connection)
-            let list_field = build_list_query(table, &type_name, options, db);
+            // List query (returns connection) — pre-filter to only tables
+            // that have a FK pointing back to the current table
+            let relevant_children: Vec<TableInfo> = all_tables
+                .iter()
+                .filter(|t| {
+                    t.foreign_keys.iter().any(|fk| {
+                        fk.foreign_table == table.name && fk.foreign_schema == table.schema
+                    })
+                })
+                .map(|t| (*t).clone())
+                .collect();
+            let list_field =
+                build_list_query(table, &type_name, options, db, &relevant_children);
             query = query.field(list_field);
 
             // Mutations for non-view tables with single-column primary keys
@@ -494,6 +505,34 @@ fn build_object_type(
 
                     FieldFuture::new(async move {
                         let parent = ctx.parent_value.try_to_value()?;
+
+                        // Check for lateral join data first
+                        let lateral_key = format!("__lateral_{child_table_name}");
+                        if let async_graphql::Value::Object(map) = parent
+                            && let Some(lateral_value) = map.get(lateral_key.as_str())
+                        {
+                            let lateral_json = gql_value_to_json(lateral_value);
+                            let all_rows: Vec<serde_json::Value> =
+                                if let serde_json::Value::Array(arr) = lateral_json {
+                                    arr
+                                } else {
+                                    vec![]
+                                };
+
+                            #[allow(clippy::cast_possible_wrap)]
+                            let total_count = all_rows.len() as i64;
+                            let offset = 0_usize;
+                            let response = connection::build_connection_response(
+                                all_rows,
+                                offset,
+                                total_count,
+                            );
+
+                            return Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                                &response,
+                            ))));
+                        }
+
                         let pk_value = if let async_graphql::Value::Object(map) = parent {
                             map.get(parent_pk_col.as_str()).cloned()
                         } else {
@@ -769,6 +808,7 @@ fn build_list_query(
     type_name: &str,
     options: &SchemaOptions,
     db: &Arc<dyn Database>,
+    all_tables: &[TableInfo],
 ) -> Field {
     let field_name = pluralize(&to_camel_case(&table.name));
     let connection_type_name = format!("{type_name}Connection");
@@ -781,6 +821,7 @@ fn build_list_query(
     let default_page_size = options.default_page_size;
     let max_page_size = options.max_page_size;
     let db = Arc::clone(db);
+    let all_tables_for_lateral: Vec<TableInfo> = all_tables.to_vec();
 
     Field::new(
         field_name,
@@ -790,6 +831,7 @@ fn build_list_query(
             let schema_name = schema_name.clone();
             let table_name = table_name.clone();
             let table_info = table_info.clone();
+            let all_tables_for_lateral = all_tables_for_lateral.clone();
 
             FieldFuture::new(async move {
                 let condition_json = extract_json_arg(&ctx, "condition");
@@ -827,6 +869,32 @@ fn build_list_query(
                     .map_or(0, |n| n + 1);
                 let limit = first.unwrap_or(default_page_size).min(max_page_size);
 
+                // Build lateral joins for has-many relationships
+                let mut lateral_selections = Vec::new();
+                for child_table in &all_tables_for_lateral {
+                    for fk in &child_table.foreign_keys {
+                        if fk.foreign_table != table_info.name
+                            || fk.foreign_schema != table_info.schema
+                            || fk.columns.len() != 1
+                            || fk.foreign_columns.len() != 1
+                        {
+                            continue;
+                        }
+
+                        lateral_selections.push(PlanNode::LateralJoin {
+                            parent_key: fk.foreign_columns[0].clone(),
+                            child_schema: child_table.schema.clone(),
+                            child_table: child_table.name.clone(),
+                            child_key: fk.columns[0].clone(),
+                            filter: None,
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                            selections: vec![],
+                        });
+                    }
+                }
+
                 // Build plan for data query
                 #[allow(clippy::cast_possible_wrap)]
                 let mut data_plan = PlanNode::Scan {
@@ -836,7 +904,7 @@ fn build_list_query(
                     order_by: order_by.clone(),
                     limit: Some(limit as i64),
                     offset: Some(offset as i64),
-                    selections: vec![],
+                    selections: lateral_selections,
                 };
 
                 apply_on_plan_hooks(&ctx, &mut data_plan);

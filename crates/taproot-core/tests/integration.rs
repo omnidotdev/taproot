@@ -1411,3 +1411,44 @@ async fn federation_entities_resolves_multiple() {
     assert_eq!(entities[1]["name"], "Bob");
     assert_eq!(entities[1]["email"], "bob@example.com");
 }
+
+#[tokio::test]
+async fn has_many_via_lateral_join() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let result = gql_schema
+        .execute(r"{ users(first: 10, orderBy: [NAME_ASC]) { edges { node { name postsByAuthorId(first: 10) { edges { node { title } } } } } } }")
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("should serialize");
+    let edges = data["users"]["edges"].as_array().expect("should be array");
+    assert_eq!(edges.len(), 2);
+
+    // Alice should have 1 post
+    let alice = &edges[0]["node"];
+    assert_eq!(alice["name"], "Alice");
+    let alice_posts = alice["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(alice_posts.len(), 1);
+    assert_eq!(alice_posts[0]["node"]["title"], "First Post");
+
+    // Bob should have 1 post
+    let bob = &edges[1]["node"];
+    assert_eq!(bob["name"], "Bob");
+    let bob_posts = bob["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(bob_posts.len(), 1);
+    assert_eq!(bob_posts[0]["node"]["title"], "Draft Post");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
