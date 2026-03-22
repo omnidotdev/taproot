@@ -568,28 +568,35 @@ fn build_unique_query(
         let arg_names = arg_names.clone();
 
         FieldFuture::new(async move {
-            // Collect argument values
-            let mut params = Vec::with_capacity(constraint_columns.len());
-            let mut where_parts = Vec::with_capacity(constraint_columns.len());
-
-            for (i, (col_name, arg_name)) in
-                constraint_columns.iter().zip(&arg_names).enumerate()
-            {
+            let mut filter_parts = Vec::with_capacity(constraint_columns.len());
+            for (col_name, arg_name) in constraint_columns.iter().zip(&arg_names) {
                 let arg_value = ctx.args.try_get(arg_name)?;
-                params.push(value_accessor_to_json(&arg_value));
-                where_parts.push(format!(
-                    "{} = ${}", quote_ident(col_name), i + 1
-                ));
+                let json_value = value_accessor_to_json(&arg_value);
+                filter_parts.push(FilterExpr::Eq {
+                    column: col_name.clone(),
+                    value: json_value,
+                });
             }
 
-            let where_clause = where_parts.join(" AND ");
-            let sql = format!(
-                "SELECT row_to_json(t.*) FROM {schema}.{table} t WHERE {where_clause}",
-                schema = quote_ident(&schema_name),
-                table = quote_ident(&table_name),
-            );
+            let filter = if filter_parts.len() == 1 {
+                filter_parts.remove(0)
+            } else {
+                FilterExpr::And(filter_parts)
+            };
 
-            let rows = db.query(&sql, &params).await.map_err(|e| {
+            let mut plan = PlanNode::Scan {
+                schema: schema_name.clone(),
+                table: table_name.clone(),
+                filter: Some(filter),
+                order_by: None,
+                limit: Some(1),
+                offset: None,
+                selections: vec![],
+            };
+
+            apply_on_plan_hooks(&ctx, &mut plan);
+
+            let rows = execute_plan(&plan, &db).await.map_err(|e| {
                 async_graphql::Error::new(format!("database error: {e}"))
             })?;
 
