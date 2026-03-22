@@ -1758,3 +1758,13 @@ mod tests {
         assert!(!is_array);
     }
 }
+
+// TODO: @defer/@stream incremental delivery support
+// async-graphql (v7) does not support @defer or @stream directives in its
+// dynamic schema API (or at all). These are still draft GraphQL spec
+// directives and most libraries haven't implemented them. When async-graphql
+// adds native support, taproot should expose incremental delivery by:
+// 1. Adding @defer on slow/expensive fields (e.g. nested relationships)
+// 2. Adding @stream on list fields (e.g. connections) for streaming results
+// 3. Using multipart HTTP responses or SSE as the transport
+// Track: https://github.com/async-graphql/async-graphql/issues
