@@ -12,6 +12,7 @@ use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstra
 use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
 
+use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
 use super::scalars::{map_udt_to_graphql, needs_custom_scalar};
 use super::types::SchemaOptions;
 use super::{connection, filters, mutations, ordering};
@@ -77,6 +78,9 @@ pub fn build_schema(
     let mut has_mutations = false;
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(plugin_store);
+
+    let loader_registry = LoaderRegistry::new(Arc::clone(db));
+    schema_builder = schema_builder.data(loader_registry);
 
     // Collect all tables across schemas for relationship resolution
     let all_tables: Vec<&TableInfo> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
@@ -295,20 +299,17 @@ fn build_object_type(
         let foreign_schema = fk.foreign_schema.clone();
         let foreign_table = fk.foreign_table.clone();
         let foreign_col = fk.foreign_columns[0].clone();
-        let db = Arc::clone(db);
 
         let field = Field::new(
             &field_name,
             TypeRef::named(&foreign_type_name),
             move |ctx| {
-                let db = Arc::clone(&db);
                 let foreign_schema = foreign_schema.clone();
                 let foreign_table = foreign_table.clone();
                 let foreign_col = foreign_col.clone();
                 let fk_col_name = fk_col_name.clone();
 
                 FieldFuture::new(async move {
-                    // Extract the FK column value from the parent object
                     let parent = ctx.parent_value.try_to_value()?;
                     let fk_value = if let async_graphql::Value::Object(map) = parent {
                         map.get(fk_col_name.as_str()).cloned()
@@ -325,22 +326,21 @@ fn build_object_type(
                     }
 
                     let fk_json = gql_value_to_json(&fk_value);
+                    let key = normalize_key(&fk_json);
 
-                    let sql = format!(
-                        "SELECT row_to_json(t.*) FROM {schema}.{table} t WHERE {col} = $1",
-                        schema = quote_ident(&foreign_schema),
-                        table = quote_ident(&foreign_table),
-                        col = quote_ident(&foreign_col),
-                    );
+                    let loader_key =
+                        LoaderKey::new(&foreign_schema, &foreign_table, &foreign_col);
 
-                    let rows = db.query(&sql, &[fk_json]).await.map_err(|e| {
-                        async_graphql::Error::new(format!("database error: {e}"))
+                    let registry = ctx.data::<LoaderRegistry>().map_err(|e| {
+                        async_graphql::Error::new(format!("loader registry not found: {e:?}"))
                     })?;
 
-                    Ok(rows
-                        .into_iter()
-                        .next()
-                        .map(|row| row_json_to_field_value(&row)))
+                    let loader = registry.get_belongs_to(&loader_key);
+                    let row = loader.load_one(key).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e:?}"))
+                    })?;
+
+                    Ok(row.map(|r| FieldValue::value(serde_json_to_gql_value(&r))))
                 })
             },
         );
