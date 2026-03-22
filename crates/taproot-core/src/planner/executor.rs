@@ -19,7 +19,17 @@ pub async fn execute_plan(
     if sql.is_empty() {
         return Ok(vec![]);
     }
-    db.query(&sql, &params).await
+    let rows = db.query(&sql, &params).await?;
+
+    // Unwrap `row_to_json` wrappers produced by `SELECT row_to_json(t.*)`
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            row.get("row_to_json")
+                .cloned()
+                .unwrap_or(row)
+        })
+        .collect())
 }
 
 /// Execute a plan node as a COUNT query (for pagination)
