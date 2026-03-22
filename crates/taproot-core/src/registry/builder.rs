@@ -139,7 +139,7 @@ pub fn build_schema(
     // Register custom scalars and build object types
     for introspected in &schemas {
         for table in &introspected.tables {
-            let type_name = to_pascal_case(&table.name);
+            let type_name = to_pascal_case(&singularize(&table.name));
 
             // Build the object type with column fields and relationship fields
             let object =
@@ -224,7 +224,7 @@ pub fn build_schema(
                     table.columns.iter().find(|c| &c.name == pk_col_name)
                 {
                     has_mutations = true;
-                    let table_field_name = to_camel_case(&table.name);
+                    let table_field_name = to_camel_case(&singularize(&table.name));
 
                     let (sb, mt) = register_mutation_types(
                         schema_builder,
@@ -408,10 +408,10 @@ fn build_object_type(
             continue;
         }
 
-        let foreign_type_name = to_pascal_case(&fk.foreign_table);
+        let foreign_type_name = to_pascal_case(&singularize(&fk.foreign_table));
         let field_name = format!(
             "{}By{}",
-            to_camel_case(&fk.foreign_table),
+            to_camel_case(&singularize(&fk.foreign_table)),
             to_pascal_case(&fk.columns[0]),
         );
 
@@ -481,11 +481,11 @@ fn build_object_type(
                 continue;
             }
 
-            let child_type_name = to_pascal_case(&child_table.name);
+            let child_type_name = to_pascal_case(&singularize(&child_table.name));
             let connection_type_name = format!("{child_type_name}Connection");
             let field_name = format!(
                 "{}By{}",
-                pluralize(&to_camel_case(&child_table.name)),
+                pluralize(&to_camel_case(&singularize(&child_table.name))),
                 to_pascal_case(&fk.columns[0]),
             );
 
@@ -684,7 +684,7 @@ fn build_singular_query(
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
 ) -> Field {
-    let field_name = to_camel_case(&table.name);
+    let field_name = to_camel_case(&singularize(&table.name));
     let (gql_type, _is_array) = resolve_column_type(pk_col, enum_names);
     let pk_arg_type = TypeRef::named_nn(gql_type);
     let pk_arg_name = to_camel_case(&pk_col.name);
@@ -752,7 +752,7 @@ fn build_unique_query(
 ) -> Field {
     // Field name: {camelTable}By{PascalCol1}{PascalCol2}...
     let suffix: String = constraint.columns.iter().map(|c| to_pascal_case(c)).collect();
-    let field_name = format!("{}By{suffix}", to_camel_case(&table.name));
+    let field_name = format!("{}By{suffix}", to_camel_case(&singularize(&table.name)));
 
     // Resolve column metadata for each unique constraint column
     let col_infos: Vec<(&ColumnInfo, String)> = constraint
@@ -892,7 +892,7 @@ fn build_list_query(
     db: &Arc<dyn Database>,
     all_tables: &[TableInfo],
 ) -> Field {
-    let field_name = pluralize(&to_camel_case(&table.name));
+    let field_name = pluralize(&to_camel_case(&singularize(&table.name)));
     let connection_type_name = format!("{type_name}Connection");
     let condition_type_name = format!("{type_name}Condition");
     let order_by_type_name = format!("{type_name}OrderBy");
@@ -1163,6 +1163,45 @@ pub fn to_camel_case(s: &str) -> String {
         result.extend(chars);
         result
     })
+}
+
+/// Naive singularization — strip trailing "s" or handle common plural suffixes.
+#[must_use]
+#[allow(clippy::option_if_let_else)]
+pub fn singularize(s: &str) -> String {
+    if let Some(base) = s.strip_suffix("ies") {
+        // categories -> category, but not "series" -> "ser"
+        if base.len() > 1 {
+            format!("{base}y")
+        } else {
+            s.to_string()
+        }
+    } else if let Some(base) = s.strip_suffix("shes") {
+        // crashes -> crash
+        format!("{base}sh")
+    } else if let Some(base) = s.strip_suffix("ches") {
+        // matches -> match
+        format!("{base}ch")
+    } else if let Some(base) = s.strip_suffix("xes") {
+        // boxes -> box
+        format!("{base}x")
+    } else if let Some(base) = s.strip_suffix("sses") {
+        // classes -> class, addresses -> address
+        format!("{base}ss")
+    } else if let Some(base) = s.strip_suffix("ses") {
+        // statuses -> status
+        format!("{base}s")
+    } else if let Some(base) = s.strip_suffix('s') {
+        // users -> user, posts -> post
+        // But not "ss" words like "class" -> "clas"
+        if base.ends_with('s') {
+            s.to_string()
+        } else {
+            base.to_string()
+        }
+    } else {
+        s.to_string()
+    }
 }
 
 /// Naive pluralization — append "s" or handle common suffixes.
@@ -1539,12 +1578,34 @@ mod tests {
     }
 
     #[test]
+    fn singularization_rules() {
+        assert_eq!(singularize("users"), "user");
+        assert_eq!(singularize("posts"), "post");
+        assert_eq!(singularize("comments"), "comment");
+        assert_eq!(singularize("statuses"), "status");
+        assert_eq!(singularize("categories"), "category");
+        assert_eq!(singularize("addresses"), "address");
+        assert_eq!(singularize("class"), "class"); // no-op
+        assert_eq!(singularize("person"), "person"); // no-op
+    }
+
+    #[test]
     fn pluralization_rules() {
         assert_eq!(pluralize("user"), "users");
         assert_eq!(pluralize("status"), "statuses");
         assert_eq!(pluralize("category"), "categories");
         assert_eq!(pluralize("key"), "keys");
         assert_eq!(pluralize("day"), "days");
+    }
+
+    #[test]
+    fn singularize_then_pluralize_roundtrip() {
+        // Ensure singularize + pluralize = original for common table names
+        assert_eq!(pluralize(&singularize("users")), "users");
+        assert_eq!(pluralize(&singularize("posts")), "posts");
+        assert_eq!(pluralize(&singularize("comments")), "comments");
+        assert_eq!(pluralize(&singularize("statuses")), "statuses");
+        assert_eq!(pluralize(&singularize("categories")), "categories");
     }
 
     #[test]
