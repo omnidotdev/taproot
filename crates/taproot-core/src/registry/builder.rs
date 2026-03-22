@@ -8,7 +8,7 @@ use async_graphql::dynamic::{
 
 use crate::db::{Database, RlsContext};
 use crate::error::{Error, Result};
-use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
+use crate::introspect::{ColumnInfo, FunctionInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
 use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
 use crate::subscription::ChangeBroadcaster;
@@ -154,8 +154,16 @@ pub fn build_schema(
             let type_name = to_pascal_case(&singularize(&table.name));
 
             // Build the object type with column fields and relationship fields
-            let object =
-                build_object_type(&type_name, table, &all_tables, &enum_names, db, options);
+            let object = build_object_type(
+                &type_name,
+                table,
+                &all_tables,
+                &enum_names,
+                db,
+                options,
+                &introspected.functions,
+                &introspected.name,
+            );
             schema_builder = schema_builder.register(object);
 
             // Register federation entity mapping
@@ -293,6 +301,31 @@ pub fn build_schema(
                     mutation = mt;
                 }
             }
+        }
+    }
+
+    // Expose non-computed STABLE/IMMUTABLE SQL functions as root query fields
+    let table_names: HashSet<String> = all_tables.iter().map(|t| t.name.clone()).collect();
+
+    for introspected in &schemas {
+        for func in &introspected.functions {
+            // Skip computed fields — they are already registered on their parent type
+            if func.computed_table.is_some() {
+                continue;
+            }
+
+            // Only expose STABLE and IMMUTABLE functions
+            if func.volatility != 's' && func.volatility != 'i' {
+                continue;
+            }
+
+            let field = build_custom_function_query(
+                func,
+                &table_names,
+                db,
+                options,
+            );
+            query = query.field(field);
         }
     }
 
@@ -507,7 +540,7 @@ pub fn build_schema(
 /// Belongs-to fields are added for FKs on this table (e.g. `userByAuthorId`).
 /// Has-many fields are added for FKs on other tables pointing here (e.g.
 /// `postsByAuthorId`).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn build_object_type(
     type_name: &str,
     table: &TableInfo,
@@ -515,6 +548,8 @@ fn build_object_type(
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
     options: &SchemaOptions,
+    functions: &[FunctionInfo],
+    schema_name: &str,
 ) -> Object {
     let mut object = Object::new(type_name);
 
@@ -825,6 +860,24 @@ fn build_object_type(
         }
     }
 
+    // Computed fields from SQL functions
+    if let Some(pk) = &table.primary_key {
+        for func in functions {
+            // Only expose functions that are computed fields for this table
+            if func.computed_table.as_deref() != Some(&table.name) {
+                continue;
+            }
+
+            // Only STABLE and IMMUTABLE functions for query fields
+            if func.volatility == 'v' {
+                continue;
+            }
+
+            let field = build_computed_field(func, schema_name, &table.name, pk, db);
+            object = object.field(field);
+        }
+    }
+
     // Mark entity types with @key for federation
     if options.federation
         && let Some(pk) = &table.primary_key
@@ -834,6 +887,477 @@ fn build_object_type(
     }
 
     object
+}
+
+/// Derive a GraphQL field name from a computed field function name.
+///
+/// If the function follows the `table_name_field_name` convention, strip the
+/// table name prefix before camel-casing. Otherwise camel-case the full name.
+fn computed_field_name(func_name: &str, table_name: &str) -> String {
+    let prefix = format!("{table_name}_");
+    let base = func_name.strip_prefix(&prefix).unwrap_or(func_name);
+    to_camel_case(base)
+}
+
+/// Build a computed field resolver for a SQL function whose first parameter is
+/// a table's row type.
+///
+/// The resolver re-fetches the row by PK and passes it to the function:
+/// `SELECT "schema"."func"(t.*) FROM "schema"."table" t WHERE t."pk" = $1`
+#[allow(clippy::too_many_lines)]
+fn build_computed_field(
+    func: &FunctionInfo,
+    schema_name: &str,
+    table_name: &str,
+    pk: &crate::introspect::PrimaryKey,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = computed_field_name(&func.name, table_name);
+
+    // Determine GraphQL return type
+    let (gql_type, is_array) = map_udt_to_graphql(&func.return_type);
+    let type_ref = if func.returns_set || is_array {
+        TypeRef::named_nn_list(gql_type)
+    } else {
+        TypeRef::named(gql_type)
+    };
+
+    let func_name = func.name.clone();
+    let func_schema = schema_name.to_string();
+    let func_table = table_name.to_string();
+    let pk_cols = pk.columns.clone();
+    let returns_set = func.returns_set;
+    let extra_args: Vec<(String, String)> = func.arguments.clone();
+    let db = Arc::clone(db);
+
+    let mut field = Field::new(field_name, type_ref, move |ctx| {
+        let db = Arc::clone(&db);
+        let func_name = func_name.clone();
+        let func_schema = func_schema.clone();
+        let func_table = func_table.clone();
+        let pk_cols = pk_cols.clone();
+        let extra_args = extra_args.clone();
+        let returns_set = returns_set;
+
+        FieldFuture::new(async move {
+            let rls = ctx.data::<RlsContext>().ok();
+            let parent = ctx.parent_value.try_to_value()?;
+
+            let async_graphql::Value::Object(map) = parent else {
+                return Ok(None);
+            };
+
+            // Build WHERE clause from PK columns
+            let mut where_parts = Vec::new();
+            let mut params: Vec<serde_json::Value> = Vec::new();
+            for (i, col) in pk_cols.iter().enumerate() {
+                let camel = to_camel_case(col);
+                let Some(pk_val) = map.get(camel.as_str()) else {
+                    return Ok(None);
+                };
+                if *pk_val == async_graphql::Value::Null {
+                    return Ok(None);
+                }
+                params.push(gql_value_to_json(pk_val));
+                where_parts.push(format!("t.\"{}\" = ${}", col, i + 1));
+            }
+
+            // Collect extra function arguments from GraphQL field args
+            for (arg_name, _) in &extra_args {
+                if arg_name.is_empty() {
+                    continue;
+                }
+                let camel_arg = to_camel_case(arg_name);
+                if let Ok(val) = ctx.args.try_get(&camel_arg) {
+                    params.push(gql_value_to_json(val.as_value()));
+                }
+            }
+
+            let where_clause = where_parts.join(" AND ");
+
+            // Build extra parameter placeholders for the function call
+            let mut func_args = String::from("t.*");
+            let base_idx = pk_cols.len() + 1;
+            for (i, (arg_name, _)) in extra_args.iter().enumerate() {
+                if arg_name.is_empty() {
+                    continue;
+                }
+                write!(func_args, ", ${}", base_idx + i).ok();
+            }
+
+            let sql = format!(
+                "SELECT \"{func_schema}\".\"{func_name}\"({func_args}) AS result \
+                 FROM \"{func_schema}\".\"{func_table}\" t \
+                 WHERE {where_clause}"
+            );
+
+            let rows = db
+                .query_with_rls(&sql, &params, rls)
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+            if returns_set {
+                let values: Vec<async_graphql::Value> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        let val = row.get("result")?;
+                        if val.is_null() {
+                            None
+                        } else {
+                            Some(serde_json_to_gql_value(val))
+                        }
+                    })
+                    .collect();
+                Ok(Some(FieldValue::value(async_graphql::Value::List(values))))
+            } else {
+                let result = rows
+                    .first()
+                    .and_then(|row| row.get("result"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                if result.is_null() {
+                    Ok(None)
+                } else {
+                    Ok(Some(FieldValue::value(serde_json_to_gql_value(&result))))
+                }
+            }
+        })
+    });
+
+    // Add extra arguments as GraphQL field arguments
+    for (arg_name, arg_type) in &func.arguments {
+        if arg_name.is_empty() {
+            continue;
+        }
+        let (gql_arg_type, _) = map_udt_to_graphql(arg_type);
+        let camel_arg = to_camel_case(arg_name);
+        field = field.argument(InputValue::new(camel_arg, TypeRef::named(gql_arg_type)));
+    }
+
+    field
+}
+
+/// Build a root query field for a non-computed SQL function.
+///
+/// Scalar functions become simple fields; SETOF-table functions use the
+/// connection pattern; SETOF-scalar functions return a list.
+#[allow(clippy::too_many_lines)]
+fn build_custom_function_query(
+    func: &FunctionInfo,
+    table_names: &HashSet<String>,
+    db: &Arc<dyn Database>,
+    options: &SchemaOptions,
+) -> Field {
+    let field_name = to_camel_case(&func.name);
+    let func_name = func.name.clone();
+    let func_schema = func.schema.clone();
+    let arguments: Vec<(String, String)> = func.arguments.clone();
+    let returns_set = func.returns_set;
+
+    // Strip schema qualification from return type if present
+    let raw_return = &func.return_type;
+    let return_base = raw_return
+        .split('.')
+        .next_back()
+        .unwrap_or(raw_return)
+        .trim_matches('"');
+
+    let is_table_return = table_names.contains(return_base);
+
+    if returns_set && is_table_return {
+        // SETOF table → connection type
+        let table_type = to_pascal_case(&singularize(return_base));
+        let connection_type_name = format!("{table_type}Connection");
+        let default_page_size = options.default_page_size;
+        let max_page_size = options.max_page_size;
+        let db = Arc::clone(db);
+        let return_base_owned = return_base.to_string();
+
+        let mut field = Field::new(
+            &field_name,
+            TypeRef::named_nn(&connection_type_name),
+            move |ctx| {
+                let db = Arc::clone(&db);
+                let func_name = func_name.clone();
+                let func_schema = func_schema.clone();
+                let arguments = arguments.clone();
+                let _return_base = return_base_owned.clone();
+
+                FieldFuture::new(async move {
+                    let rls = ctx.data::<RlsContext>().ok();
+
+                    // Collect function arguments
+                    let mut params: Vec<serde_json::Value> = Vec::new();
+                    for (arg_name, _) in &arguments {
+                        if arg_name.is_empty() {
+                            continue;
+                        }
+                        let camel_arg = to_camel_case(arg_name);
+                        if let Ok(val) = ctx.args.try_get(&camel_arg) {
+                            params.push(value_accessor_to_json(&val));
+                        }
+                    }
+
+                    // Build function call parameter placeholders
+                    let placeholders: Vec<String> = (1..=params.len())
+                        .map(|i| format!("${i}"))
+                        .collect();
+                    let func_call = format!(
+                        "\"{func_schema}\".\"{func_name}\"({})",
+                        placeholders.join(", ")
+                    );
+
+                    // Parse pagination args
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let first = ctx
+                        .args
+                        .try_get("first")
+                        .ok()
+                        .and_then(|v| v.i64().ok())
+                        .map(|n| n.max(0) as usize);
+
+                    let after = ctx
+                        .args
+                        .try_get("after")
+                        .ok()
+                        .and_then(|v| v.string().ok().map(str::to_owned));
+
+                    let offset = after
+                        .as_deref()
+                        .and_then(connection::decode_cursor)
+                        .map_or(0, |n| n + 1);
+                    let limit = first.unwrap_or(default_page_size).min(max_page_size);
+
+                    // Count query
+                    let count_sql = format!(
+                        "SELECT COUNT(*) AS count FROM {func_call} AS t"
+                    );
+                    let count_rows = db
+                        .query_with_rls(&count_sql, &params, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    let total_count = count_rows
+                        .first()
+                        .and_then(|r| r.get("count"))
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+
+                    // Data query
+                    let param_count = params.len();
+                    let data_sql = format!(
+                        "SELECT row_to_json(t.*) FROM {func_call} AS t \
+                         LIMIT ${} OFFSET ${}",
+                        param_count + 1,
+                        param_count + 2,
+                    );
+
+                    let mut data_params = params;
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        data_params.push(serde_json::json!(limit as i64));
+                        data_params.push(serde_json::json!(offset as i64));
+                    }
+
+                    let rows = db
+                        .query_with_rls(&data_sql, &data_params, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                    // Unwrap row_to_json wrappers and remap column names to camelCase
+                    let rows: Vec<serde_json::Value> = rows
+                        .into_iter()
+                        .map(|row| {
+                            let unwrapped = row
+                                .get("row_to_json")
+                                .cloned()
+                                .unwrap_or(row);
+
+                            if let serde_json::Value::Object(map) = unwrapped {
+                                let remapped: serde_json::Map<String, serde_json::Value> = map
+                                    .into_iter()
+                                    .map(|(k, v)| (to_camel_case(&k), v))
+                                    .collect();
+                                serde_json::Value::Object(remapped)
+                            } else {
+                                unwrapped
+                            }
+                        })
+                        .collect();
+
+                    let response = connection::build_connection_response(
+                        rows, offset, total_count,
+                    );
+
+                    Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
+                })
+            },
+        );
+
+        // Add function arguments
+        for (arg_name, arg_type) in &func.arguments {
+            if arg_name.is_empty() {
+                continue;
+            }
+            let (gql_arg_type, _) = map_udt_to_graphql(arg_type);
+            let camel_arg = to_camel_case(arg_name);
+            field = field.argument(InputValue::new(
+                camel_arg,
+                TypeRef::named_nn(gql_arg_type),
+            ));
+        }
+
+        // Add pagination arguments
+        field = field
+            .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)));
+
+        field
+    } else if returns_set {
+        // SETOF scalar → return list
+        let (gql_type, _is_array) = map_udt_to_graphql(return_base);
+        let db = Arc::clone(db);
+
+        let mut field = Field::new(
+            &field_name,
+            TypeRef::named_nn_list(gql_type),
+            move |ctx| {
+                let db = Arc::clone(&db);
+                let func_name = func_name.clone();
+                let func_schema = func_schema.clone();
+                let arguments = arguments.clone();
+
+                FieldFuture::new(async move {
+                    let rls = ctx.data::<RlsContext>().ok();
+
+                    let mut params: Vec<serde_json::Value> = Vec::new();
+                    for (arg_name, _) in &arguments {
+                        if arg_name.is_empty() {
+                            continue;
+                        }
+                        let camel_arg = to_camel_case(arg_name);
+                        if let Ok(val) = ctx.args.try_get(&camel_arg) {
+                            params.push(value_accessor_to_json(&val));
+                        }
+                    }
+
+                    let placeholders: Vec<String> = (1..=params.len())
+                        .map(|i| format!("${i}"))
+                        .collect();
+
+                    let sql = format!(
+                        "SELECT \"{func_schema}\".\"{func_name}\"({}) AS result",
+                        placeholders.join(", ")
+                    );
+
+                    let rows = db
+                        .query_with_rls(&sql, &params, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                    let values: Vec<async_graphql::Value> = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let val = row.get("result")?;
+                            if val.is_null() {
+                                None
+                            } else {
+                                Some(serde_json_to_gql_value(val))
+                            }
+                        })
+                        .collect();
+
+                    Ok(Some(FieldValue::value(async_graphql::Value::List(values))))
+                })
+            },
+        );
+
+        for (arg_name, arg_type) in &func.arguments {
+            if arg_name.is_empty() {
+                continue;
+            }
+            let (gql_arg_type, _) = map_udt_to_graphql(arg_type);
+            let camel_arg = to_camel_case(arg_name);
+            field = field.argument(InputValue::new(
+                camel_arg,
+                TypeRef::named_nn(gql_arg_type),
+            ));
+        }
+
+        field
+    } else {
+        // Scalar return → simple field
+        let (gql_type, _is_array) = map_udt_to_graphql(return_base);
+        let db = Arc::clone(db);
+
+        let mut field = Field::new(
+            &field_name,
+            TypeRef::named(gql_type),
+            move |ctx| {
+                let db = Arc::clone(&db);
+                let func_name = func_name.clone();
+                let func_schema = func_schema.clone();
+                let arguments = arguments.clone();
+
+                FieldFuture::new(async move {
+                    let rls = ctx.data::<RlsContext>().ok();
+
+                    let mut params: Vec<serde_json::Value> = Vec::new();
+                    for (arg_name, _) in &arguments {
+                        if arg_name.is_empty() {
+                            continue;
+                        }
+                        let camel_arg = to_camel_case(arg_name);
+                        if let Ok(val) = ctx.args.try_get(&camel_arg) {
+                            params.push(value_accessor_to_json(&val));
+                        }
+                    }
+
+                    let placeholders: Vec<String> = (1..=params.len())
+                        .map(|i| format!("${i}"))
+                        .collect();
+
+                    let sql = format!(
+                        "SELECT \"{func_schema}\".\"{func_name}\"({}) AS result",
+                        placeholders.join(", ")
+                    );
+
+                    let rows = db
+                        .query_with_rls(&sql, &params, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                    let result = rows
+                        .first()
+                        .and_then(|row| row.get("result"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    if result.is_null() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(FieldValue::value(serde_json_to_gql_value(&result))))
+                    }
+                })
+            },
+        );
+
+        for (arg_name, arg_type) in &func.arguments {
+            if arg_name.is_empty() {
+                continue;
+            }
+            let (gql_arg_type, _) = map_udt_to_graphql(arg_type);
+            let camel_arg = to_camel_case(arg_name);
+            field = field.argument(InputValue::new(
+                camel_arg,
+                TypeRef::named_nn(gql_arg_type),
+            ));
+        }
+
+        field
+    }
 }
 
 /// Build a singular query field: `user(id: UUID!): User`

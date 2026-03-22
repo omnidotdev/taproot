@@ -2570,3 +2570,327 @@ async fn bulk_delete_mutation() {
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0]["body"], "Great post!");
 }
+
+#[tokio::test]
+async fn computed_field_from_sql_function() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a stable SQL function whose first arg is a users row type
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".user_display_name(u \"{schema_name}\".users) \
+         RETURNS text AS $$ \
+           SELECT u.name || ' <' || u.email || '>' \
+         $$ LANGUAGE sql STABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Query the computed field via GraphQL
+    let query = r#"
+        query {
+            user(id: "00000000-0000-0000-0000-000000000001") {
+                name
+                userDisplayName
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "computed field query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let user = &data["user"];
+    assert_eq!(user["name"], "Alice");
+    assert_eq!(user["userDisplayName"], "Alice <alice@example.com>");
+}
+
+#[tokio::test]
+async fn computed_field_volatile_excluded() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a volatile function — should NOT appear as a computed field
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".user_random_tag(u \"{schema_name}\".users) \
+         RETURNS text AS $$ \
+           SELECT 'tag-' || gen_random_uuid()::text \
+         $$ LANGUAGE sql VOLATILE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // The volatile function should not be queryable
+    let query = r#"
+        query {
+            user(id: "00000000-0000-0000-0000-000000000001") {
+                name
+                userRandomTag
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    // Expect an error because the field should not exist
+    assert!(
+        !result.errors.is_empty(),
+        "volatile function should not be exposed as a computed field"
+    );
+}
+
+#[tokio::test]
+async fn computed_field_with_setof_return() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a SETOF-returning stable function
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".user_email_parts(u \"{schema_name}\".users) \
+         RETURNS SETOF text AS $$ \
+           SELECT unnest(string_to_array(u.email, '@')) \
+         $$ LANGUAGE sql STABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"
+        query {
+            user(id: "00000000-0000-0000-0000-000000000001") {
+                name
+                userEmailParts
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "setof computed field query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let parts = data["user"]["userEmailParts"]
+        .as_array()
+        .expect("should be an array");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], "alice");
+    assert_eq!(parts[1], "example.com");
+}
+
+// ── Custom function query fields ─────────────────────────────────────────
+
+#[tokio::test]
+async fn scalar_function_as_root_query() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create an IMMUTABLE scalar function (not a computed field)
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".add_numbers(a integer, b integer) \
+         RETURNS integer AS $$ \
+           SELECT a + b \
+         $$ LANGUAGE sql IMMUTABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r"
+        query {
+            addNumbers(a: 3, b: 4)
+        }
+    ";
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "scalar function query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    assert_eq!(data["addNumbers"], 7);
+}
+
+#[tokio::test]
+async fn setof_table_function_as_root_query() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a STABLE SETOF table function
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".search_users(term text) \
+         RETURNS SETOF \"{schema_name}\".users AS $$ \
+           SELECT * FROM \"{schema_name}\".users WHERE name ILIKE '%' || term || '%' \
+         $$ LANGUAGE sql STABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"
+        query {
+            searchUsers(term: "ali", first: 10) {
+                edges {
+                    node {
+                        name
+                    }
+                }
+                totalCount
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "setof table function query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let edges = data["searchUsers"]["edges"]
+        .as_array()
+        .expect("should be an array");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["node"]["name"], "Alice");
+    assert_eq!(data["searchUsers"]["totalCount"], 1);
+}
+
+#[tokio::test]
+async fn volatile_function_not_exposed_as_root_query() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a VOLATILE function — should NOT appear as a root query
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".random_number() \
+         RETURNS integer AS $$ \
+           SELECT floor(random() * 100)::integer \
+         $$ LANGUAGE sql VOLATILE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r"
+        query {
+            randomNumber
+        }
+    ";
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        !result.errors.is_empty(),
+        "volatile function should not be exposed as a root query field"
+    );
+}
+
+#[tokio::test]
+async fn setof_scalar_function_as_root_query() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a STABLE SETOF scalar function
+    let create_fn = format!(
+        "CREATE FUNCTION \"{schema_name}\".all_user_names() \
+         RETURNS SETOF text AS $$ \
+           SELECT name FROM \"{schema_name}\".users ORDER BY name \
+         $$ LANGUAGE sql STABLE"
+    );
+    db.query_raw(&create_fn)
+        .await
+        .expect("create function failed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r"
+        query {
+            allUserNames
+        }
+    ";
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "setof scalar function query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let names = data["allUserNames"]
+        .as_array()
+        .expect("should be an array");
+    assert_eq!(names.len(), 2);
+    assert_eq!(names[0], "Alice");
+    assert_eq!(names[1], "Bob");
+}
