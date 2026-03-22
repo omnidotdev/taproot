@@ -18,11 +18,35 @@ pub trait TransactionOps: Send {
 
     /// Apply RLS context (SET LOCAL) within the transaction.
     async fn set_rls(&mut self, rls: &RlsContext) -> Result<()>;
+
+    /// Execute a query with RLS context within the transaction.
+    async fn query_with_rls(
+        &mut self,
+        sql: &str,
+        params: &[serde_json::Value],
+        rls: Option<&RlsContext>,
+    ) -> Result<Vec<JsonRow>> {
+        if let Some(rls) = rls {
+            self.set_rls(rls).await?;
+        }
+        self.query(sql, params).await
+    }
 }
 
 /// Transaction wrapper around a sqlx Postgres transaction.
+///
+/// If dropped without calling `commit()` or `rollback()`, the underlying
+/// sqlx transaction will automatically roll back (implicit rollback-on-drop).
 pub struct SqlxTransaction {
     tx: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl std::fmt::Debug for SqlxTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqlxTransaction")
+            .field("active", &self.tx.is_some())
+            .finish()
+    }
 }
 
 impl SqlxTransaction {
@@ -483,15 +507,6 @@ mod tests {
 
         let backend = SqlxBackend::connect(&url).await.unwrap();
 
-        // Create a temp table
-        backend
-            .query_raw(
-                "CREATE TEMPORARY TABLE _taproot_tx_test (id serial PRIMARY KEY, val text) ON COMMIT DROP",
-            )
-            .await
-            .unwrap();
-
-        // Actually we need a table that survives commits, use a unique name
         let table = format!("_taproot_tx_commit_{}", std::process::id());
         backend
             .query_raw(&format!(
