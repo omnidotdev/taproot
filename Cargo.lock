@@ -2301,6 +2301,7 @@ version = "0.1.0"
 dependencies = [
  "async-graphql",
  "async-trait",
+ "base64",
  "bigdecimal",
  "chrono",
  "serde",

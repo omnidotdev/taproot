@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{
@@ -7,32 +8,60 @@ use async_graphql::dynamic::{
 
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::introspect::{ColumnInfo, IntrospectedSchema};
+use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
+use crate::plugin::Plugin;
 
 use super::scalars::{map_udt_to_graphql, needs_custom_scalar};
 use super::types::SchemaOptions;
+use super::{connection, filters, mutations, ordering};
 
 /// Build a dynamic `async_graphql` schema from introspected database metadata.
 ///
 /// Each table becomes a `GraphQL` object type, with singular and list root query
 /// fields generated automatically based on column types and primary keys.
+/// Foreign keys produce belongs-to and has-many relationship fields.
 ///
 /// # Errors
 /// Returns an error if the schema fails validation.
+#[allow(clippy::too_many_lines)]
 pub fn build_schema(
     schemas: &[IntrospectedSchema],
     db: &Arc<dyn Database>,
     options: &SchemaOptions,
+    plugins: &[Arc<dyn Plugin>],
 ) -> Result<Schema> {
+    // Clone schemas so plugins can mutate them
+    let mut schemas = schemas.to_vec();
+
+    // Run plugin on_introspect hooks
+    for plugin in plugins {
+        for schema in &mut schemas {
+            tracing::debug!(plugin = plugin.name(), schema = %schema.name, "running on_introspect");
+            plugin.on_introspect(schema);
+        }
+    }
+
+    // Run plugin filter_table hooks
+    for schema in &mut schemas {
+        schema.tables.retain(|table| {
+            plugins.iter().all(|p| p.filter_table(table))
+        });
+    }
+
     let mut custom_scalars: HashSet<&'static str> = HashSet::new();
     let mut query = Object::new("Query");
 
     // Collect all enum type names for lookup during column mapping
     let mut enum_names: HashSet<String> = HashSet::new();
-    let mut schema_builder = Schema::build("Query", None, None);
+    let mut mutation = Object::new("Mutation");
+    let mut has_mutations = false;
+    let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
+
+    // Collect all tables across schemas for relationship resolution
+    let all_tables: Vec<&TableInfo> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
 
     // Register enum types
-    for introspected in schemas {
+    for introspected in &schemas {
         for enum_info in &introspected.enums {
             let gql_name = to_pascal_case(&enum_info.name);
             enum_names.insert(enum_info.name.clone());
@@ -46,8 +75,16 @@ pub fn build_schema(
         }
     }
 
+    // Register scalar condition types (StringCondition, IntCondition, etc)
+    for condition_input in filters::build_scalar_conditions() {
+        schema_builder = schema_builder.register(condition_input);
+    }
+
+    // Register PageInfo (shared across all connections)
+    schema_builder = schema_builder.register(connection::build_page_info_type());
+
     // Register custom scalars and build object types
-    for introspected in schemas {
+    for introspected in &schemas {
         for table in &introspected.tables {
             let type_name = to_pascal_case(&table.name);
 
@@ -59,9 +96,25 @@ pub fn build_schema(
                 }
             }
 
-            // Build the object type
-            let object = build_object_type(&type_name, &table.columns, &enum_names);
+            // Build the object type with column fields and relationship fields
+            let object =
+                build_object_type(&type_name, table, &all_tables, &enum_names, db, options);
             schema_builder = schema_builder.register(object);
+
+            // Register per-table condition input type
+            let condition_input = filters::build_table_condition(table, &type_name);
+            schema_builder = schema_builder.register(condition_input);
+
+            // Register per-table order-by enum
+            let order_by_enum = ordering::build_table_order_by(table, &type_name);
+            schema_builder = schema_builder.register(order_by_enum);
+
+            // Register connection and edge types
+            let connection_type = connection::build_connection_type(&type_name);
+            schema_builder = schema_builder.register(connection_type);
+
+            let edge_type = connection::build_edge_type(&type_name);
+            schema_builder = schema_builder.register(edge_type);
 
             // Singular query (by single-column primary key)
             if let Some(pk) = &table.primary_key
@@ -75,9 +128,51 @@ pub fn build_schema(
                 }
             }
 
-            // List query
+            // Unique constraint queries
+            for uc in &table.unique_constraints {
+                // Skip if this constraint matches the primary key
+                if table
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|pk| pk.columns == uc.columns)
+                {
+                    continue;
+                }
+
+                let field = build_unique_query(table, &type_name, uc, &enum_names, db);
+                query = query.field(field);
+            }
+
+            // List query (returns connection)
             let list_field = build_list_query(table, &type_name, options, db);
             query = query.field(list_field);
+
+            // Mutations for non-view tables with single-column primary keys
+            if !table.is_view
+                && let Some(pk) = &table.primary_key
+                && pk.columns.len() == 1
+            {
+                let pk_col_name = &pk.columns[0];
+                if let Some(pk_col) =
+                    table.columns.iter().find(|c| &c.name == pk_col_name)
+                {
+                    has_mutations = true;
+                    let table_field_name = to_camel_case(&table.name);
+
+                    let (sb, mt) = register_mutation_types(
+                        schema_builder,
+                        mutation,
+                        table,
+                        &type_name,
+                        &table_field_name,
+                        pk_col,
+                        &enum_names,
+                        db,
+                    );
+                    schema_builder = sb;
+                    mutation = mt;
+                }
+            }
         }
     }
 
@@ -88,6 +183,16 @@ pub fn build_schema(
 
     schema_builder = schema_builder.register(query);
 
+    if !has_mutations {
+        // Schema requires at least one field on the mutation type
+        mutation = mutation.field(Field::new(
+            "_empty",
+            TypeRef::named(TypeRef::STRING),
+            |_| FieldFuture::new(async { Ok(None::<FieldValue<'_>>) }),
+        ));
+    }
+    schema_builder = schema_builder.register(mutation);
+
     if options.federation {
         schema_builder = schema_builder.enable_federation();
     }
@@ -97,15 +202,25 @@ pub fn build_schema(
         .map_err(|e| Error::Schema(e.to_string()))
 }
 
-/// Build a `GraphQL` object type from a table's columns.
+/// Build a `GraphQL` object type from a table's columns, including relationship
+/// fields derived from foreign keys.
+///
+/// Belongs-to fields are added for FKs on this table (e.g. `userByAuthorId`).
+/// Has-many fields are added for FKs on other tables pointing here (e.g.
+/// `postsByAuthorId`).
+#[allow(clippy::too_many_lines)]
 fn build_object_type(
     type_name: &str,
-    columns: &[ColumnInfo],
+    table: &TableInfo,
+    all_tables: &[&TableInfo],
     enum_names: &HashSet<String>,
+    db: &Arc<dyn Database>,
+    options: &SchemaOptions,
 ) -> Object {
     let mut object = Object::new(type_name);
 
-    for col in columns {
+    // Column fields
+    for col in &table.columns {
         let field_name = to_camel_case(&col.name);
         let type_ref = column_to_type_ref(col, enum_names);
 
@@ -129,6 +244,186 @@ fn build_object_type(
         });
 
         object = object.field(field);
+    }
+
+    // Belongs-to fields (FK on this table pointing to another table)
+    for fk in &table.foreign_keys {
+        // Only support single-column FKs
+        if fk.columns.len() != 1 || fk.foreign_columns.len() != 1 {
+            continue;
+        }
+
+        let foreign_type_name = to_pascal_case(&fk.foreign_table);
+        let field_name = format!(
+            "{}By{}",
+            to_camel_case(&fk.foreign_table),
+            to_pascal_case(&fk.columns[0]),
+        );
+
+        let fk_col_name = fk.columns[0].clone();
+        let foreign_schema = fk.foreign_schema.clone();
+        let foreign_table = fk.foreign_table.clone();
+        let foreign_col = fk.foreign_columns[0].clone();
+        let db = Arc::clone(db);
+
+        let field = Field::new(
+            &field_name,
+            TypeRef::named(&foreign_type_name),
+            move |ctx| {
+                let db = Arc::clone(&db);
+                let foreign_schema = foreign_schema.clone();
+                let foreign_table = foreign_table.clone();
+                let foreign_col = foreign_col.clone();
+                let fk_col_name = fk_col_name.clone();
+
+                FieldFuture::new(async move {
+                    // Extract the FK column value from the parent object
+                    let parent = ctx.parent_value.try_to_value()?;
+                    let fk_value = if let async_graphql::Value::Object(map) = parent {
+                        map.get(fk_col_name.as_str()).cloned()
+                    } else {
+                        None
+                    };
+
+                    let Some(fk_value) = fk_value else {
+                        return Ok(None);
+                    };
+
+                    if fk_value == async_graphql::Value::Null {
+                        return Ok(None);
+                    }
+
+                    let fk_json = gql_value_to_json(&fk_value);
+
+                    let sql = format!(
+                        "SELECT row_to_json(t.*) FROM {schema}.{table} t WHERE {col} = $1",
+                        schema = quote_ident(&foreign_schema),
+                        table = quote_ident(&foreign_table),
+                        col = quote_ident(&foreign_col),
+                    );
+
+                    let rows = db.query(&sql, &[fk_json]).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    Ok(rows
+                        .into_iter()
+                        .next()
+                        .map(|row| row_json_to_field_value(&row)))
+                })
+            },
+        );
+
+        object = object.field(field);
+    }
+
+    // Has-many fields (FK on other tables pointing to this table)
+    for child_table in all_tables {
+        for fk in &child_table.foreign_keys {
+            // Only match FKs pointing to this table in the same schema
+            if fk.foreign_table != table.name || fk.foreign_schema != table.schema {
+                continue;
+            }
+
+            // Only support single-column FKs
+            if fk.columns.len() != 1 || fk.foreign_columns.len() != 1 {
+                continue;
+            }
+
+            let child_type_name = to_pascal_case(&child_table.name);
+            let connection_type_name = format!("{child_type_name}Connection");
+            let field_name = format!(
+                "{}By{}",
+                pluralize(&to_camel_case(&child_table.name)),
+                to_pascal_case(&fk.columns[0]),
+            );
+
+            let child_schema = child_table.schema.clone();
+            let child_table_name = child_table.name.clone();
+            let child_fk_col = fk.columns[0].clone();
+            let parent_pk_col = fk.foreign_columns[0].clone();
+            let default_page_size = options.default_page_size;
+            let max_page_size = options.max_page_size;
+            let db = Arc::clone(db);
+
+            let field = Field::new(
+                &field_name,
+                TypeRef::named_nn(&connection_type_name),
+                move |ctx| {
+                    let db = Arc::clone(&db);
+                    let child_schema = child_schema.clone();
+                    let child_table_name = child_table_name.clone();
+                    let child_fk_col = child_fk_col.clone();
+                    let parent_pk_col = parent_pk_col.clone();
+
+                    FieldFuture::new(async move {
+                        // Extract the parent PK value
+                        let parent = ctx.parent_value.try_to_value()?;
+                        let pk_value = if let async_graphql::Value::Object(map) = parent {
+                            map.get(parent_pk_col.as_str()).cloned()
+                        } else {
+                            None
+                        };
+
+                        let Some(pk_value) = pk_value else {
+                            let empty = connection::build_connection_response(vec![], 0, 0);
+                            return Ok(Some(FieldValue::value(serde_json_to_gql_value(&empty))));
+                        };
+
+                        let pk_json = gql_value_to_json(&pk_value);
+
+                        // Parse pagination args
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        let first = ctx
+                            .args
+                            .try_get("first")
+                            .ok()
+                            .and_then(|v| v.i64().ok())
+                            .map(|n| n.max(0) as usize);
+
+                        let after = ctx
+                            .args
+                            .try_get("after")
+                            .ok()
+                            .and_then(|v| v.string().ok().map(str::to_owned));
+
+                        let offset = after
+                            .as_deref()
+                            .and_then(connection::decode_cursor)
+                            .map_or(0, |n| n + 1);
+                        let limit = first.unwrap_or(default_page_size).min(max_page_size);
+
+                        let schema_table = format!(
+                            "{}.{}",
+                            quote_ident(&child_schema),
+                            quote_ident(&child_table_name),
+                        );
+
+                        let where_clause = format!("{} = $1", quote_ident(&child_fk_col));
+
+                        let (total_count, rows) = execute_connection_queries(
+                            &db,
+                            &schema_table,
+                            &where_clause,
+                            "",
+                            &[pk_json],
+                            limit,
+                            offset,
+                        )
+                        .await?;
+
+                        let response =
+                            connection::build_connection_response(rows, offset, total_count);
+
+                        Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
+                    })
+                },
+            )
+            .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)));
+
+            object = object.field(field);
+        }
     }
 
     object
@@ -188,46 +483,268 @@ fn build_singular_query(
     .argument(InputValue::new(pk_arg_name, pk_arg_type))
 }
 
-/// Build a list query field: `users: [User!]!`
+/// Build a singular query field for a unique constraint.
+///
+/// For example, a UNIQUE on `users.email` produces `userByEmail(email: String!): User`.
+/// Composite unique constraints produce multiple arguments:
+/// `postBySlugAndLocale(slug: String!, locale: String!): Post`.
+fn build_unique_query(
+    table: &TableInfo,
+    type_name: &str,
+    constraint: &UniqueConstraint,
+    enum_names: &HashSet<String>,
+    db: &Arc<dyn Database>,
+) -> Field {
+    // Field name: {camelTable}By{PascalCol1}{PascalCol2}...
+    let suffix: String = constraint.columns.iter().map(|c| to_pascal_case(c)).collect();
+    let field_name = format!("{}By{suffix}", to_camel_case(&table.name));
+
+    // Resolve column metadata for each unique constraint column
+    let col_infos: Vec<(&ColumnInfo, String)> = constraint
+        .columns
+        .iter()
+        .filter_map(|col_name| {
+            table
+                .columns
+                .iter()
+                .find(|c| &c.name == col_name)
+                .map(|col| {
+                    let (gql_type, _) = resolve_column_type(col, enum_names);
+                    (col, gql_type)
+                })
+        })
+        .collect();
+
+    let schema_name = table.schema.clone();
+    let table_name = table.name.clone();
+    let constraint_columns: Vec<String> = constraint.columns.clone();
+    let arg_names: Vec<String> = constraint.columns.iter().map(|c| to_camel_case(c)).collect();
+    let db = Arc::clone(db);
+
+    let mut field = Field::new(field_name, TypeRef::named(type_name), move |ctx| {
+        let db = Arc::clone(&db);
+        let schema_name = schema_name.clone();
+        let table_name = table_name.clone();
+        let constraint_columns = constraint_columns.clone();
+        let arg_names = arg_names.clone();
+
+        FieldFuture::new(async move {
+            // Collect argument values
+            let mut params = Vec::with_capacity(constraint_columns.len());
+            let mut where_parts = Vec::with_capacity(constraint_columns.len());
+
+            for (i, (col_name, arg_name)) in
+                constraint_columns.iter().zip(&arg_names).enumerate()
+            {
+                let arg_value = ctx.args.try_get(arg_name)?;
+                params.push(value_accessor_to_json(&arg_value));
+                where_parts.push(format!(
+                    "{} = ${}", quote_ident(col_name), i + 1
+                ));
+            }
+
+            let where_clause = where_parts.join(" AND ");
+            let sql = format!(
+                "SELECT row_to_json(t.*) FROM {schema}.{table} t WHERE {where_clause}",
+                schema = quote_ident(&schema_name),
+                table = quote_ident(&table_name),
+            );
+
+            let rows = db.query(&sql, &params).await.map_err(|e| {
+                async_graphql::Error::new(format!("database error: {e}"))
+            })?;
+
+            Ok(rows
+                .into_iter()
+                .next()
+                .map(|row| row_json_to_field_value(&row)))
+        })
+    });
+
+    // Add each unique constraint column as a required argument
+    for (col, gql_type) in &col_infos {
+        let arg_name = to_camel_case(&col.name);
+        field = field.argument(InputValue::new(arg_name, TypeRef::named_nn(gql_type.as_str())));
+    }
+
+    field
+}
+
+/// Build a list query field that returns a Relay-style connection.
+///
+/// Accepts `condition`, `orderBy`, `first`, and `after` arguments and returns
+/// a `{Type}Connection` with edges, nodes, page info, and total count.
+#[allow(clippy::too_many_lines)]
 fn build_list_query(
-    table: &crate::introspect::TableInfo,
+    table: &TableInfo,
     type_name: &str,
     options: &SchemaOptions,
     db: &Arc<dyn Database>,
 ) -> Field {
     let field_name = pluralize(&to_camel_case(&table.name));
-    let list_type = TypeRef::named_nn_list_nn(type_name);
+    let connection_type_name = format!("{type_name}Connection");
+    let condition_type_name = format!("{type_name}Condition");
+    let order_by_type_name = format!("{type_name}OrderBy");
 
     let schema_name = table.schema.clone();
     let table_name = table.name.clone();
+    let table_info = table.clone();
+    let default_page_size = options.default_page_size;
     let max_page_size = options.max_page_size;
     let db = Arc::clone(db);
 
-    Field::new(field_name, list_type, move |_ctx| {
-        let db = Arc::clone(&db);
-        let schema_name = schema_name.clone();
-        let table_name = table_name.clone();
+    Field::new(
+        field_name,
+        TypeRef::named_nn(&connection_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_name = table_name.clone();
+            let table_info = table_info.clone();
 
-        FieldFuture::new(async move {
-            let sql = format!(
-                "SELECT row_to_json(t.*) FROM {schema}.{table} t LIMIT {limit}",
-                schema = quote_ident(&schema_name),
-                table = quote_ident(&table_name),
-                limit = max_page_size,
-            );
+            FieldFuture::new(async move {
+                let condition_json = extract_json_arg(&ctx, "condition");
+                let order_json = extract_json_arg(&ctx, "orderBy");
 
-            let rows = db.query_raw(&sql).await.map_err(|e| {
-                async_graphql::Error::new(format!("database error: {e}"))
-            })?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let first = ctx
+                    .args
+                    .try_get("first")
+                    .ok()
+                    .and_then(|v| v.i64().ok())
+                    .map(|n| n.max(0) as usize);
 
-            let values: Vec<FieldValue<'_>> = rows
-                .iter()
-                .map(|row| row_json_to_field_value(row))
-                .collect();
+                let after = ctx
+                    .args
+                    .try_get("after")
+                    .ok()
+                    .and_then(|v| v.string().ok().map(str::to_owned));
 
-            Ok(Some(FieldValue::list(values)))
+                // Build WHERE clause
+                let (where_clause, params) = condition_json
+                    .as_ref()
+                    .map_or_else(
+                        || (String::new(), vec![]),
+                        |c| filters::condition_to_sql(c, &table_info, 0),
+                    );
+
+                // Build ORDER BY clause
+                let order_clause = order_json
+                    .as_ref()
+                    .map_or_else(String::new, |o| ordering::order_by_to_sql(o, &table_info));
+
+                // Cursor-based offset
+                let offset = after
+                    .as_deref()
+                    .and_then(connection::decode_cursor)
+                    .map_or(0, |n| n + 1);
+                let limit = first.unwrap_or(default_page_size).min(max_page_size);
+
+                let schema_table = format!(
+                    "{}.{}",
+                    quote_ident(&schema_name),
+                    quote_ident(&table_name),
+                );
+
+                let (total_count, rows) = execute_connection_queries(
+                    &db,
+                    &schema_table,
+                    &where_clause,
+                    &order_clause,
+                    &params,
+                    limit,
+                    offset,
+                )
+                .await?;
+
+                let response =
+                    connection::build_connection_response(rows, offset, total_count);
+
+                Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
+            })
+        },
+    )
+    .argument(InputValue::new(
+        "condition",
+        TypeRef::named(&condition_type_name),
+    ))
+    .argument(InputValue::new(
+        "orderBy",
+        TypeRef::named_nn_list(&order_by_type_name),
+    ))
+    .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+}
+
+/// Extract a JSON argument from the resolver context, returning `None` for
+/// missing or null values
+fn extract_json_arg(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    name: &str,
+) -> Option<serde_json::Value> {
+    ctx.args
+        .try_get(name)
+        .ok()
+        .map(|v| gql_value_to_json(v.as_value()))
+        .filter(|v| !v.is_null())
+}
+
+/// Execute the COUNT and SELECT queries for a connection response.
+///
+/// Returns `(total_count, rows)` where rows have the `row_to_json` wrapper
+/// unwrapped.
+async fn execute_connection_queries(
+    db: &Arc<dyn Database>,
+    schema_table: &str,
+    where_clause: &str,
+    order_clause: &str,
+    params: &[serde_json::Value],
+    limit: usize,
+    offset: usize,
+) -> std::result::Result<(i64, Vec<serde_json::Value>), async_graphql::Error> {
+    // COUNT query
+    let mut count_sql = format!("SELECT COUNT(*) AS count FROM {schema_table} t");
+    if !where_clause.is_empty() {
+        let _ = write!(count_sql, " WHERE {where_clause}");
+    }
+
+    let count_rows = db
+        .query(&count_sql, params)
+        .await
+        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+    let total_count = count_rows
+        .first()
+        .and_then(|r| r.get("count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    // DATA query
+    let mut data_sql = format!("SELECT row_to_json(t.*) FROM {schema_table} t");
+    if !where_clause.is_empty() {
+        let _ = write!(data_sql, " WHERE {where_clause}");
+    }
+    if !order_clause.is_empty() {
+        let _ = write!(data_sql, " ORDER BY {order_clause}");
+    }
+    let _ = write!(data_sql, " LIMIT {limit} OFFSET {offset}");
+
+    let data_rows = db
+        .query(&data_sql, params)
+        .await
+        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+    // Unwrap row_to_json wrappers
+    let rows: Vec<serde_json::Value> = data_rows
+        .iter()
+        .map(|row| {
+            row.get("row_to_json")
+                .cloned()
+                .unwrap_or_else(|| row.clone())
         })
-    })
+        .collect();
+
+    Ok((total_count, rows))
 }
 
 /// Resolve a column's `udt_name` to a `GraphQL` type name, accounting for enums.
@@ -382,6 +899,327 @@ pub fn pluralize(s: &str) -> String {
 /// Quote a SQL identifier to prevent injection.
 fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Register all mutation input types, payload types, and mutation fields
+/// for a single table.
+#[allow(clippy::too_many_arguments)]
+fn register_mutation_types(
+    mut schema_builder: async_graphql::dynamic::SchemaBuilder,
+    mut mutation: Object,
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    pk_col: &ColumnInfo,
+    enum_names: &HashSet<String>,
+    db: &Arc<dyn Database>,
+) -> (async_graphql::dynamic::SchemaBuilder, Object) {
+    // Register input types
+    schema_builder =
+        schema_builder.register(mutations::build_create_input(table, type_name, enum_names));
+    schema_builder =
+        schema_builder.register(mutations::build_update_input(table, type_name, pk_col, enum_names));
+    schema_builder =
+        schema_builder.register(mutations::build_update_patch(table, type_name, pk_col, enum_names));
+    schema_builder =
+        schema_builder.register(mutations::build_delete_input(table, type_name, pk_col, enum_names));
+
+    // Register payload types
+    schema_builder = schema_builder.register(build_mutation_payload(
+        &format!("Create{type_name}"),
+        table_field_name,
+        type_name,
+    ));
+    schema_builder = schema_builder.register(build_mutation_payload(
+        &format!("Update{type_name}"),
+        table_field_name,
+        type_name,
+    ));
+    schema_builder = schema_builder.register(build_mutation_payload(
+        &format!("Delete{type_name}"),
+        table_field_name,
+        type_name,
+    ));
+
+    // Register mutation fields
+    mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db));
+    mutation = mutation.field(build_update_mutation(table, type_name, table_field_name, pk_col, db));
+    mutation = mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_col, db));
+
+    (schema_builder, mutation)
+}
+
+/// Build a mutation payload object type with `clientMutationId` and the entity field.
+fn build_mutation_payload(
+    prefix: &str,
+    table_field_name: &str,
+    entity_type_name: &str,
+) -> Object {
+    let payload_name = format!("{prefix}Payload");
+    let field_name = table_field_name.to_string();
+    let entity_type = entity_type_name.to_string();
+
+    let field_name_clone = field_name.clone();
+
+    let mut payload = Object::new(&payload_name);
+
+    payload = payload.field(Field::new(
+        "clientMutationId",
+        TypeRef::named(TypeRef::STRING),
+        |ctx| {
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    Ok(map.get("clientMutationId").cloned().map(FieldValue::value))
+                } else {
+                    Ok(None)
+                }
+            })
+        },
+    ));
+
+    payload = payload.field(Field::new(
+        field_name,
+        TypeRef::named(&entity_type),
+        move |ctx| {
+            let field_name = field_name_clone.clone();
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    match map.get(field_name.as_str()).cloned() {
+                        Some(async_graphql::Value::Null) | None => Ok(None),
+                        Some(v) => Ok(Some(FieldValue::value(v))),
+                    }
+                } else {
+                    Ok(None)
+                }
+            })
+        },
+    ));
+
+    payload
+}
+
+/// Build a `create{Type}` mutation field.
+#[allow(clippy::too_many_lines)]
+fn build_create_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = format!("create{type_name}");
+    let input_type_name = format!("Create{type_name}Input");
+    let payload_type_name = format!("Create{type_name}Payload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let table_field = table_field_name.to_string();
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let table_field = table_field.clone();
+
+            FieldFuture::new(async move {
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let (sql, params) =
+                    mutations::create_to_sql(&input_json, &table_info, &schema_name);
+
+                let rows = db.query(&sql, &params).await.map_err(|e| {
+                    async_graphql::Error::new(format!("database error: {e}"))
+                })?;
+
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| {
+                        r.get("row_to_json").cloned().or(Some(r))
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+
+                let mut payload = serde_json::Map::new();
+                payload.insert("clientMutationId".to_string(), client_mutation_id);
+                payload.insert(table_field, row);
+
+                Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                    &serde_json::Value::Object(payload),
+                ))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build an `update{Type}` mutation field.
+#[allow(clippy::too_many_lines)]
+fn build_update_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    pk_col: &ColumnInfo,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = format!("update{type_name}");
+    let input_type_name = format!("Update{type_name}Input");
+    let payload_type_name = format!("Update{type_name}Payload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let table_field = table_field_name.to_string();
+    let pk_col_name = pk_col.name.clone();
+    let pk_field_name = to_camel_case(&pk_col.name);
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let table_field = table_field.clone();
+            let pk_col_name = pk_col_name.clone();
+            let pk_field_name = pk_field_name.clone();
+
+            FieldFuture::new(async move {
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let pk_value = input_json
+                    .get(&pk_field_name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let patch = input_json
+                    .get("patch")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let (sql, params) = mutations::update_to_sql(
+                    &pk_col_name,
+                    &pk_value,
+                    &patch,
+                    &table_info,
+                    &schema_name,
+                );
+
+                let rows = db.query(&sql, &params).await.map_err(|e| {
+                    async_graphql::Error::new(format!("database error: {e}"))
+                })?;
+
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| {
+                        r.get("row_to_json").cloned().or(Some(r))
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+
+                let mut payload = serde_json::Map::new();
+                payload.insert("clientMutationId".to_string(), client_mutation_id);
+                payload.insert(table_field, row);
+
+                Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                    &serde_json::Value::Object(payload),
+                ))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build a `delete{Type}` mutation field.
+fn build_delete_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    pk_col: &ColumnInfo,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = format!("delete{type_name}");
+    let input_type_name = format!("Delete{type_name}Input");
+    let payload_type_name = format!("Delete{type_name}Payload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let table_field = table_field_name.to_string();
+    let pk_col_name = pk_col.name.clone();
+    let pk_field_name = to_camel_case(&pk_col.name);
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let table_field = table_field.clone();
+            let pk_col_name = pk_col_name.clone();
+            let pk_field_name = pk_field_name.clone();
+
+            FieldFuture::new(async move {
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let pk_value = input_json
+                    .get(&pk_field_name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let (sql, params) = mutations::delete_to_sql(
+                    &pk_col_name,
+                    &pk_value,
+                    &table_info,
+                    &schema_name,
+                );
+
+                let rows = db.query(&sql, &params).await.map_err(|e| {
+                    async_graphql::Error::new(format!("database error: {e}"))
+                })?;
+
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| {
+                        r.get("row_to_json").cloned().or(Some(r))
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+
+                let mut payload = serde_json::Map::new();
+                payload.insert("clientMutationId".to_string(), client_mutation_id);
+                payload.insert(table_field, row);
+
+                Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                    &serde_json::Value::Object(payload),
+                ))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
 }
 
 #[cfg(test)]

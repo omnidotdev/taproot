@@ -1,4 +1,8 @@
 mod builder;
+pub mod connection;
+pub mod filters;
+pub mod mutations;
+pub mod ordering;
 pub mod scalars;
 pub mod types;
 
