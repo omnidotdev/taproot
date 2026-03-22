@@ -1,6 +1,8 @@
+use std::fmt::Write;
+
 use serde_json::Value;
 
-use super::FilterExpr;
+use super::{FilterExpr, OrderByExpr, OrderDirection, PlanNode};
 
 /// Quote a SQL identifier, escaping embedded double quotes
 fn quote_ident(name: &str) -> String {
@@ -80,6 +82,124 @@ fn compile_compound(children: &[FilterExpr], joiner: &str, param_offset: usize) 
 
     let sql = format!("({})", fragments.join(&format!(" {joiner} ")));
     (sql, all_params)
+}
+
+/// Compile an `OrderDirection` to its SQL representation
+const fn compile_direction(dir: OrderDirection) -> &'static str {
+    match dir {
+        OrderDirection::Asc => "ASC",
+        OrderDirection::Desc => "DESC",
+        OrderDirection::AscNullsFirst => "ASC NULLS FIRST",
+        OrderDirection::AscNullsLast => "ASC NULLS LAST",
+        OrderDirection::DescNullsFirst => "DESC NULLS FIRST",
+        OrderDirection::DescNullsLast => "DESC NULLS LAST",
+    }
+}
+
+/// Compile an ORDER BY clause from a list of order expressions
+fn compile_order_by(exprs: &[OrderByExpr]) -> String {
+    let parts: Vec<String> = exprs
+        .iter()
+        .map(|e| format!("{} {}", quote_ident(&e.column), compile_direction(e.direction)))
+        .collect();
+    parts.join(", ")
+}
+
+/// Compile a `PlanNode` into a parameterized SQL query
+#[must_use]
+pub fn compile_plan(plan: &PlanNode) -> (String, Vec<Value>) {
+    match plan {
+        PlanNode::Scan {
+            schema,
+            table,
+            filter,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            let mut sql = format!(
+                "SELECT row_to_json(t.*) FROM {}.{} t",
+                quote_ident(schema),
+                quote_ident(table),
+            );
+
+            let params = filter.as_ref().map_or_else(Vec::new, |expr| {
+                let (where_sql, where_params) = compile_filter(expr, 1);
+                let _ = write!(sql, " WHERE {where_sql}");
+                where_params
+            });
+
+            if let Some(order_exprs) = order_by
+                && !order_exprs.is_empty()
+            {
+                let _ = write!(sql, " ORDER BY {}", compile_order_by(order_exprs));
+            }
+
+            if let Some(lim) = limit {
+                let _ = write!(sql, " LIMIT {lim}");
+            }
+
+            if let Some(off) = offset {
+                let _ = write!(sql, " OFFSET {off}");
+            }
+
+            (sql, params)
+        }
+
+        PlanNode::BatchLookup {
+            schema,
+            table,
+            key_column,
+            keys,
+            ..
+        } => {
+            let placeholders: Vec<String> = (1..=keys.len())
+                .map(|i| format!("${i}"))
+                .collect();
+            let sql = format!(
+                "SELECT row_to_json(t.*) FROM {}.{} t WHERE {} IN ({})",
+                quote_ident(schema),
+                quote_ident(table),
+                quote_ident(key_column),
+                placeholders.join(", "),
+            );
+            (sql, keys.clone())
+        }
+
+        // Other node types are not yet supported
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+/// Compile a `PlanNode` into a `SELECT COUNT(*)` query (for connection pagination)
+#[must_use]
+pub fn compile_plan_count(plan: &PlanNode) -> (String, Vec<Value>) {
+    match plan {
+        PlanNode::Scan {
+            schema,
+            table,
+            filter,
+            ..
+        } => {
+            let mut sql = format!(
+                "SELECT COUNT(*) AS count FROM {}.{} t",
+                quote_ident(schema),
+                quote_ident(table),
+            );
+
+            let params = filter.as_ref().map_or_else(Vec::new, |expr| {
+                let (where_sql, where_params) = compile_filter(expr, 1);
+                let _ = write!(sql, " WHERE {where_sql}");
+                where_params
+            });
+
+            (sql, params)
+        }
+
+        // Other node types are not yet supported
+        _ => (String::new(), Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +303,95 @@ mod tests {
             let (sql, _) = compile_filter(&expr, 1);
             assert_eq!(sql, format!("\"a\" {op} $1"));
         }
+    }
+
+    #[test]
+    fn compile_scan_simple() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::Column { name: "id".into() }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert_eq!(sql, "SELECT row_to_json(t.*) FROM \"public\".\"users\" t");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn compile_scan_with_filter() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: Some(FilterExpr::Eq { column: "id".into(), value: serde_json::json!("abc") }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert_eq!(sql, "SELECT row_to_json(t.*) FROM \"public\".\"users\" t WHERE \"id\" = $1");
+        assert_eq!(params, vec![serde_json::json!("abc")]);
+    }
+
+    #[test]
+    fn compile_scan_with_order_limit_offset() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: Some(vec![
+                OrderByExpr { column: "name".into(), direction: OrderDirection::Asc },
+                OrderByExpr { column: "id".into(), direction: OrderDirection::DescNullsLast },
+            ]),
+            limit: Some(10),
+            offset: Some(20),
+            selections: vec![],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert_eq!(
+            sql,
+            "SELECT row_to_json(t.*) FROM \"public\".\"users\" t ORDER BY \"name\" ASC, \"id\" DESC NULLS LAST LIMIT 10 OFFSET 20"
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn compile_batch_lookup() {
+        let plan = PlanNode::BatchLookup {
+            schema: "public".into(),
+            table: "users".into(),
+            key_column: "id".into(),
+            keys: vec![serde_json::json!("a"), serde_json::json!("b"), serde_json::json!("c")],
+            selections: vec![],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert_eq!(
+            sql,
+            "SELECT row_to_json(t.*) FROM \"public\".\"users\" t WHERE \"id\" IN ($1, $2, $3)"
+        );
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn compile_scan_count() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "posts".into(),
+            filter: Some(FilterExpr::Eq { column: "author_id".into(), value: serde_json::json!("u1") }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![],
+        };
+        let (sql, params) = compile_plan_count(&plan);
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) AS count FROM \"public\".\"posts\" t WHERE \"author_id\" = $1"
+        );
+        assert_eq!(params.len(), 1);
     }
 }
