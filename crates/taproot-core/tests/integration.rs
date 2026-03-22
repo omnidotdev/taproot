@@ -2,6 +2,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use taproot_core::db::{Database, SqlxBackend};
+use taproot_core::planner::{
+    execute_batch_lookup, execute_plan, execute_plan_count, FilterExpr, OrderByExpr, OrderDirection,
+    PlanNode,
+};
 use taproot_core::registry::types::SchemaOptions;
 use taproot_core::{IntrospectOptions, Plugin, build_schema, introspect};
 
@@ -821,4 +825,235 @@ async fn plugin_filters_tables() {
 
     assert!(!sdl.contains("Post"), "Post type should be filtered out");
     assert!(sdl.contains("User"), "User type should remain");
+}
+
+#[tokio::test]
+async fn plan_scan_all_users() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let plan = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        filter: None,
+        order_by: Some(vec![OrderByExpr {
+            column: "name".into(),
+            direction: OrderDirection::Asc,
+        }]),
+        limit: None,
+        offset: None,
+        selections: vec![],
+    };
+
+    let rows = execute_plan(&plan, &db_arc)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(rows.len(), 2, "should find both seeded users");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn plan_scan_with_filter() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let plan = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        filter: Some(FilterExpr::Eq {
+            column: "name".into(),
+            value: serde_json::json!("Alice"),
+        }),
+        order_by: None,
+        limit: None,
+        offset: None,
+        selections: vec![],
+    };
+
+    let rows = execute_plan(&plan, &db_arc)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "Alice");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn plan_scan_count() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let plan = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "posts".into(),
+        filter: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        selections: vec![],
+    };
+
+    let count = execute_plan_count(&plan, &db_arc)
+        .await
+        .expect("count should succeed");
+    assert_eq!(count, 2, "should count both seeded posts");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn plan_batch_lookup() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    // Batch lookup both users by their known IDs
+    let batch_plan = PlanNode::BatchLookup {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        key_column: "id".into(),
+        keys: vec![
+            serde_json::json!("00000000-0000-0000-0000-000000000001"),
+            serde_json::json!("00000000-0000-0000-0000-000000000002"),
+        ],
+        selections: vec![],
+    };
+
+    let grouped = execute_batch_lookup(&batch_plan, &db_arc)
+        .await
+        .expect("batch lookup should succeed");
+    assert_eq!(grouped.len(), 2, "should have 2 groups (one per user)");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn plan_scan_with_pagination() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    // Page 1: first user
+    let plan = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        filter: None,
+        order_by: Some(vec![OrderByExpr {
+            column: "name".into(),
+            direction: OrderDirection::Asc,
+        }]),
+        limit: Some(1),
+        offset: Some(0),
+        selections: vec![],
+    };
+
+    let page1 = execute_plan(&plan, &db_arc)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(page1.len(), 1, "page 1 should have 1 row");
+    assert_eq!(page1[0]["name"], "Alice", "first alphabetically");
+
+    // Page 2: second user
+    let plan_p2 = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        filter: None,
+        order_by: Some(vec![OrderByExpr {
+            column: "name".into(),
+            direction: OrderDirection::Asc,
+        }]),
+        limit: Some(1),
+        offset: Some(1),
+        selections: vec![],
+    };
+
+    let page2 = execute_plan(&plan_p2, &db_arc)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(page2.len(), 1, "page 2 should have 1 row");
+    assert_eq!(page2[0]["name"], "Bob", "second alphabetically");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+// Plugin that filters to only Alice
+struct OnlyAlicePlugin;
+
+#[allow(clippy::unnecessary_literal_bound)]
+impl Plugin for OnlyAlicePlugin {
+    fn name(&self) -> &str {
+        "only-alice"
+    }
+    fn on_plan(&self, plan: &mut PlanNode) {
+        if let PlanNode::Scan { filter, table, .. } = plan
+            && table == "users"
+        {
+            let alice_filter = FilterExpr::Eq {
+                column: "name".into(),
+                value: serde_json::json!("Alice"),
+            };
+            *filter = Some(match filter.take() {
+                Some(existing) => FilterExpr::And(vec![existing, alice_filter]),
+                None => alice_filter,
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan_with_plugin_on_plan_hook() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let mut plan = PlanNode::Scan {
+        schema: schema_name.clone(),
+        table: "users".into(),
+        filter: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        selections: vec![],
+    };
+
+    // Apply plugin
+    let plugin = OnlyAlicePlugin;
+    plugin.on_plan(&mut plan);
+
+    let rows = execute_plan(&plan, &db_arc)
+        .await
+        .expect("scan should succeed");
+    assert_eq!(rows.len(), 1, "plugin should filter to only Alice");
+    assert_eq!(rows[0]["name"], "Alice");
+
+    teardown_test_schema(&db, &schema_name).await;
 }
