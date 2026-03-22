@@ -50,6 +50,15 @@ async fn setup_test_schema(db: &dyn Database, schema: &str) {
         ),
         &format!("COMMENT ON TABLE \"{schema}\".posts IS 'Blog posts'"),
         &format!("COMMENT ON COLUMN \"{schema}\".posts.title IS 'Post title'"),
+        &format!(
+            "CREATE TABLE \"{schema}\".comments (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                body TEXT NOT NULL,
+                post_id UUID NOT NULL REFERENCES \"{schema}\".posts(id),
+                author_id UUID NOT NULL REFERENCES \"{schema}\".users(id),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"
+        ),
     ];
 
     for stmt in &ddl {
@@ -67,6 +76,12 @@ async fn setup_test_schema(db: &dyn Database, schema: &str) {
             "INSERT INTO \"{schema}\".posts (id, title, content, author_id, published) VALUES \
              ('10000000-0000-0000-0000-000000000001', 'First Post', 'Hello world', '00000000-0000-0000-0000-000000000001', true), \
              ('10000000-0000-0000-0000-000000000002', 'Draft Post', 'Work in progress', '00000000-0000-0000-0000-000000000002', false)"
+        ),
+        &format!(
+            "INSERT INTO \"{schema}\".comments (id, body, post_id, author_id) VALUES \
+             ('20000000-0000-0000-0000-000000000001', 'Great post!', '10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002'), \
+             ('20000000-0000-0000-0000-000000000002', 'Thanks!', '10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001'), \
+             ('20000000-0000-0000-0000-000000000003', 'Nice draft', '10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001')"
         ),
     ];
 
