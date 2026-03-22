@@ -1135,3 +1135,123 @@ async fn on_plan_hook_filters_real_graphql_queries() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+#[tokio::test]
+async fn belongs_to_batched_via_dataloader() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Query all posts with their authors — triggers belongs-to DataLoader batching
+    let result = gql_schema
+        .execute("{ posts { nodes { title userByAuthorId { name email } } } }")
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("should serialize");
+    let nodes = data["posts"]["nodes"]
+        .as_array()
+        .expect("should be array");
+
+    // Both posts should have their authors resolved
+    for node in nodes {
+        assert!(
+            !node["userByAuthorId"].is_null(),
+            "author should be resolved for: {}",
+            node["title"]
+        );
+    }
+
+    let first_post = nodes
+        .iter()
+        .find(|n| n["title"] == "First Post")
+        .unwrap();
+    assert_eq!(first_post["userByAuthorId"]["name"], "Alice");
+
+    let draft_post = nodes
+        .iter()
+        .find(|n| n["title"] == "Draft Post")
+        .unwrap();
+    assert_eq!(draft_post["userByAuthorId"]["name"], "Bob");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+// Plugin that filters posts to only published ones
+struct PublishedOnlyPlugin;
+
+#[allow(clippy::unnecessary_literal_bound)]
+impl Plugin for PublishedOnlyPlugin {
+    fn name(&self) -> &str {
+        "published-only"
+    }
+    fn on_plan(&self, plan: &mut PlanNode) {
+        if let PlanNode::Scan { filter, table, .. } = plan
+            && table == "posts"
+        {
+            let published_filter = FilterExpr::Eq {
+                column: "published".into(),
+                value: serde_json::json!(true),
+            };
+            *filter = Some(match filter.take() {
+                Some(existing) => FilterExpr::And(vec![existing, published_filter]),
+                None => published_filter,
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn has_many_with_on_plan_hook() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            exclude_tables: Vec::new(),
+            smart_comments: true,
+        },
+    )
+    .await
+    .expect("introspection should succeed");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PublishedOnlyPlugin)];
+
+    let gql_schema = build_schema(
+        &introspected,
+        &db_arc,
+        &SchemaOptions::default(),
+        &plugins,
+    )
+    .expect("schema build should succeed");
+
+    // Query Alice's posts — plugin should filter to only published
+    let result = gql_schema
+        .execute(
+            r#"{ user(id: "00000000-0000-0000-0000-000000000001") { name postsByAuthorId { nodes { title published } totalCount } } }"#,
+        )
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("should serialize");
+
+    let posts = &data["user"]["postsByAuthorId"];
+    let total = posts["totalCount"].as_i64().unwrap();
+    assert_eq!(total, 1, "only published posts should be counted");
+
+    let nodes = posts["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "only published posts should be returned");
+    assert_eq!(nodes[0]["title"], "First Post");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
