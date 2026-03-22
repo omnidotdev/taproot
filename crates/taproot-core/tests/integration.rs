@@ -1255,3 +1255,159 @@ async fn has_many_with_on_plan_hook() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+#[tokio::test]
+async fn federation_sdl_contains_key_directives() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection should succeed");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let options = SchemaOptions {
+        federation: true,
+        ..Default::default()
+    };
+
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+
+    let sdl = gql_schema.sdl();
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    // Types with PKs should have @key directives
+    assert!(sdl.contains("@key"), "@key directive missing from SDL");
+    assert!(sdl.contains("User"), "User type missing from SDL");
+    assert!(sdl.contains("Post"), "Post type missing from SDL");
+}
+
+#[tokio::test]
+async fn federation_entities_resolves_by_key() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection should succeed");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let options = SchemaOptions {
+        federation: true,
+        ..Default::default()
+    };
+
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+
+    // Resolve Alice by her entity key
+    let query = r#"
+        {
+            _entities(representations: [
+                { __typename: "User", id: "00000000-0000-0000-0000-000000000001" }
+            ]) {
+                ... on User { name email }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "_entities query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let entities = data["_entities"]
+        .as_array()
+        .expect("_entities should be an array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["name"], "Alice");
+    assert_eq!(entities[0]["email"], "alice@example.com");
+}
+
+#[tokio::test]
+async fn federation_entities_resolves_multiple() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection should succeed");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let options = SchemaOptions {
+        federation: true,
+        ..Default::default()
+    };
+
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
+
+    // Resolve both Alice and Bob in a single _entities call
+    let query = r#"
+        {
+            _entities(representations: [
+                { __typename: "User", id: "00000000-0000-0000-0000-000000000001" },
+                { __typename: "User", id: "00000000-0000-0000-0000-000000000002" }
+            ]) {
+                ... on User { name email }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "_entities query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let entities = data["_entities"]
+        .as_array()
+        .expect("_entities should be an array");
+    assert_eq!(entities.len(), 2, "expected 2 resolved entities");
+
+    // Order should match the representations order
+    assert_eq!(entities[0]["name"], "Alice");
+    assert_eq!(entities[0]["email"], "alice@example.com");
+    assert_eq!(entities[1]["name"], "Bob");
+    assert_eq!(entities[1]["email"], "bob@example.com");
+}
