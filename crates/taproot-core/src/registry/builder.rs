@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{
@@ -791,64 +790,6 @@ fn extract_json_arg(
         .filter(|v| !v.is_null())
 }
 
-/// Execute the COUNT and SELECT queries for a connection response.
-///
-/// Returns `(total_count, rows)` where rows have the `row_to_json` wrapper
-/// unwrapped.
-async fn execute_connection_queries(
-    db: &Arc<dyn Database>,
-    schema_table: &str,
-    where_clause: &str,
-    order_clause: &str,
-    params: &[serde_json::Value],
-    limit: usize,
-    offset: usize,
-) -> std::result::Result<(i64, Vec<serde_json::Value>), async_graphql::Error> {
-    // COUNT query
-    let mut count_sql = format!("SELECT COUNT(*) AS count FROM {schema_table} t");
-    if !where_clause.is_empty() {
-        let _ = write!(count_sql, " WHERE {where_clause}");
-    }
-
-    let count_rows = db
-        .query(&count_sql, params)
-        .await
-        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
-
-    let total_count = count_rows
-        .first()
-        .and_then(|r| r.get("count"))
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-
-    // DATA query
-    let mut data_sql = format!("SELECT row_to_json(t.*) FROM {schema_table} t");
-    if !where_clause.is_empty() {
-        let _ = write!(data_sql, " WHERE {where_clause}");
-    }
-    if !order_clause.is_empty() {
-        let _ = write!(data_sql, " ORDER BY {order_clause}");
-    }
-    let _ = write!(data_sql, " LIMIT {limit} OFFSET {offset}");
-
-    let data_rows = db
-        .query(&data_sql, params)
-        .await
-        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
-
-    // Unwrap row_to_json wrappers
-    let rows: Vec<serde_json::Value> = data_rows
-        .iter()
-        .map(|row| {
-            row.get("row_to_json")
-                .cloned()
-                .unwrap_or_else(|| row.clone())
-        })
-        .collect();
-
-    Ok((total_count, rows))
-}
-
 /// Resolve a column's `udt_name` to a `GraphQL` type name, accounting for enums.
 fn resolve_column_type(col: &ColumnInfo, enum_names: &HashSet<String>) -> (String, bool) {
     let base_udt = col.udt_name.strip_prefix('_').unwrap_or(&col.udt_name);
@@ -998,10 +939,6 @@ pub fn pluralize(s: &str) -> String {
     }
 }
 
-/// Quote a SQL identifier to prevent injection.
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
 
 /// Register all mutation input types, payload types, and mutation fields
 /// for a single table.
@@ -1366,12 +1303,6 @@ mod tests {
         assert_eq!(pluralize("category"), "categories");
         assert_eq!(pluralize("key"), "keys");
         assert_eq!(pluralize("day"), "days");
-    }
-
-    #[test]
-    fn quote_ident_escapes() {
-        assert_eq!(quote_ident("table"), "\"table\"");
-        assert_eq!(quote_ident("my\"table"), "\"my\"\"table\"");
     }
 
     #[test]
