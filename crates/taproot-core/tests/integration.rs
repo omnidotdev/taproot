@@ -1057,3 +1057,81 @@ async fn plan_with_plugin_on_plan_hook() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+// Plugin that injects a name="Alice" filter into any Scan on the users table,
+// used to prove on_plan hooks apply during real GraphQL execution
+struct OnlyAliceQueryPlugin;
+
+#[allow(clippy::unnecessary_literal_bound)]
+impl Plugin for OnlyAliceQueryPlugin {
+    fn name(&self) -> &str {
+        "only-alice-query"
+    }
+    fn on_plan(&self, plan: &mut PlanNode) {
+        if let PlanNode::Scan { filter, table, .. } = plan
+            && table == "users"
+        {
+            let alice_filter = FilterExpr::Eq {
+                column: "name".into(),
+                value: serde_json::json!("Alice"),
+            };
+            *filter = Some(match filter.take() {
+                Some(existing) => FilterExpr::And(vec![existing, alice_filter]),
+                None => alice_filter,
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn on_plan_hook_filters_real_graphql_queries() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Build schema WITH the on_plan plugin
+    let options = IntrospectOptions {
+        schemas: vec![schema_name.clone()],
+        exclude_tables: Vec::new(),
+        smart_comments: true,
+    };
+    let introspected = introspect(&db, &options).await.unwrap();
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OnlyAliceQueryPlugin)];
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins).unwrap();
+
+    // List query should return only Alice
+    let list_result = gql_schema
+        .execute("{ users { nodes { name } totalCount } }")
+        .await;
+    assert!(
+        list_result.errors.is_empty(),
+        "list query errors: {:?}",
+        list_result.errors
+    );
+    let list_data = list_result.data.into_json().expect("failed to serialize");
+    let conn = list_data.get("users").expect("users missing");
+    let nodes = conn["nodes"].as_array().expect("nodes missing");
+    assert_eq!(nodes.len(), 1, "plugin should filter to only Alice");
+    assert_eq!(nodes[0]["name"], "Alice");
+
+    // Singular query for Bob should return null (filtered out by plugin)
+    let bob_result = gql_schema
+        .execute(r#"{ user(id: "00000000-0000-0000-0000-000000000002") { name } }"#)
+        .await;
+    assert!(
+        bob_result.errors.is_empty(),
+        "singular query errors: {:?}",
+        bob_result.errors
+    );
+    let bob_data = bob_result.data.into_json().expect("failed to serialize");
+    assert!(
+        bob_data["user"].is_null(),
+        "Bob should be filtered out by on_plan hook"
+    );
+
+    teardown_test_schema(&db, &schema_name).await;
+}
