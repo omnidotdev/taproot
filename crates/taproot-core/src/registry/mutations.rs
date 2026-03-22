@@ -13,6 +13,7 @@ use super::builder::{to_camel_case, to_pascal_case};
 use super::scalars::map_udt_to_graphql;
 
 /// Descriptor for a nested relationship field on a create input type.
+#[derive(Debug)]
 pub struct NestedRelField {
     /// GraphQL field name (e.g. `userByAuthorId`, `commentsByPostId`)
     pub field_name: String,
