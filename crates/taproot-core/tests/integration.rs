@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use taproot_core::db::{Database, SqlxBackend};
+use taproot_core::db::{Database, RlsContext, SqlxBackend};
 use taproot_core::planner::{
     execute_batch_lookup, execute_plan, execute_plan_count, FilterExpr, OrderByExpr, OrderDirection,
     PlanNode,
@@ -1712,5 +1712,110 @@ async fn deep_nested_has_many_via_lateral_join() {
     );
     assert_eq!(draft_comments[0]["node"]["body"], "Nice draft");
 
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn rls_filters_rows_by_context() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Create a test role for RLS
+    let role_name = format!("{schema_name}_role");
+    let rls_ddl = [
+        // Enable RLS on users table
+        format!("ALTER TABLE \"{schema_name}\".users ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE \"{schema_name}\".users FORCE ROW LEVEL SECURITY"),
+        // Create policy: user can only see their own row based on JWT sub claim
+        format!(
+            "CREATE POLICY users_own_row ON \"{schema_name}\".users \
+             FOR SELECT USING (id::text = current_setting('request.jwt.claims', true)::jsonb->>'sub')"
+        ),
+        // Create role and grant access
+        format!("CREATE ROLE \"{role_name}\" NOLOGIN"),
+        format!("GRANT USAGE ON SCHEMA \"{schema_name}\" TO \"{role_name}\""),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA \"{schema_name}\" TO \"{role_name}\""),
+    ];
+
+    for stmt in &rls_ddl {
+        db.query_raw(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("RLS DDL failed: {stmt}: {e}"));
+    }
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &[]).expect("schema build");
+
+    // Query as Alice — should only see Alice's row
+    let rls_ctx = RlsContext {
+        role: Some(role_name.clone()),
+        claims_json: Some(r#"{"sub":"00000000-0000-0000-0000-000000000001"}"#.into()),
+        claims_setting: "request.jwt.claims".into(),
+    };
+
+    let request =
+        async_graphql::Request::new(r#"{ users(first: 10) { edges { node { name } } } }"#)
+            .data(rls_ctx);
+
+    let result = gql_schema.execute(request).await;
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("serialize");
+    let edges = data["users"]["edges"].as_array().expect("array");
+
+    // RLS should filter to only Alice
+    assert_eq!(
+        edges.len(),
+        1,
+        "RLS should filter to one user, got {}",
+        edges.len()
+    );
+    assert_eq!(edges[0]["node"]["name"], "Alice");
+
+    // Query as Bob — should only see Bob
+    let rls_ctx_bob = RlsContext {
+        role: Some(role_name.clone()),
+        claims_json: Some(r#"{"sub":"00000000-0000-0000-0000-000000000002"}"#.into()),
+        claims_setting: "request.jwt.claims".into(),
+    };
+
+    let request_bob =
+        async_graphql::Request::new(r#"{ users(first: 10) { edges { node { name } } } }"#)
+            .data(rls_ctx_bob);
+
+    let result_bob = gql_schema.execute(request_bob).await;
+    assert!(
+        result_bob.errors.is_empty(),
+        "errors: {:?}",
+        result_bob.errors
+    );
+
+    let data_bob = result_bob.data.into_json().expect("serialize");
+    let edges_bob = data_bob["users"]["edges"].as_array().expect("array");
+    assert_eq!(
+        edges_bob.len(),
+        1,
+        "RLS should filter to one user for Bob"
+    );
+    assert_eq!(edges_bob[0]["node"]["name"], "Bob");
+
+    // Cleanup: drop the role
+    let _ = db
+        .query_raw(&format!("DROP ROLE IF EXISTS \"{role_name}\""))
+        .await;
     teardown_test_schema(&db, &schema_name).await;
 }
