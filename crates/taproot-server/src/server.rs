@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_graphql::dynamic::Schema;
 use async_graphql::http::GraphiQLSource;
+use async_graphql_axum::GraphQLSubscription;
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
@@ -25,12 +26,13 @@ pub struct AppState {
 /// Build the axum router with `GraphQL` and health check routes.
 pub fn build_router(schema: Schema, config: &ServerConfig, auth: &AuthConfig) -> Router {
     let state = AppState {
-        schema: Arc::new(schema),
+        schema: Arc::new(schema.clone()),
         auth: auth.clone(),
     };
 
     let mut router = Router::new()
         .route("/graphql", get(graphql_get).post(graphql_post))
+        .route_service("/graphql/ws", GraphQLSubscription::new(schema))
         .route("/health", get(health));
 
     if config.playground {

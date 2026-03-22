@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use taproot_core::db::SqlxBackend;
 use taproot_core::introspect::types::IntrospectOptions;
+use taproot_core::subscription::{ChangeBroadcaster, ChangeNotification};
 use taproot_core::{build_schema, introspect};
 use tracing::info;
 
@@ -33,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Load configuration
-    let cfg = config::Config::from_file(&cli.config)
+    let mut cfg = config::Config::from_file(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     // Connect to database
@@ -59,9 +60,30 @@ async fn main() -> anyhow::Result<()> {
     let table_count: usize = schemas.iter().map(|s| s.tables.len()).sum();
     info!(table_count, "introspection complete");
 
+    // Create subscription broadcaster
+    let broadcaster = if cfg.subscriptions.enabled {
+        cfg.schema.subscriptions = true;
+        Some(ChangeBroadcaster::new(256))
+    } else {
+        None
+    };
+
     // Build GraphQL schema
-    let gql_schema = build_schema(&schemas, &db, &cfg.schema, &[], None)
+    let gql_schema = build_schema(&schemas, &db, &cfg.schema, &[], broadcaster.as_ref())
         .context("failed to build GraphQL schema")?;
+
+    // Start subscription listener if enabled
+    if let Some(ref broadcaster) = broadcaster {
+        let db_url = cfg.database.url.clone();
+        let channel = cfg.subscriptions.notify_channel.clone();
+        let bc = broadcaster.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = listen_task(&db_url, &channel, &bc).await {
+                tracing::error!(error = %e, "subscription listener failed");
+            }
+        });
+    }
 
     // Build and start server
     let router = server::build_router(gql_schema, &cfg.server, &cfg.auth);
@@ -81,6 +103,37 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// Background task that listens for Postgres NOTIFY events and broadcasts them
+async fn listen_task(
+    db_url: &str,
+    channel: &str,
+    broadcaster: &ChangeBroadcaster,
+) -> anyhow::Result<()> {
+    use sqlx::postgres::PgListener;
+
+    let mut listener = PgListener::connect(db_url).await?;
+    listener.listen(channel).await?;
+    tracing::info!(channel, "subscription listener started");
+
+    loop {
+        let notification = listener.recv().await?;
+        if let Some(change) = ChangeNotification::from_payload(notification.payload()) {
+            tracing::debug!(
+                table = %change.table,
+                op = ?change.op,
+                id = %change.id,
+                "received change notification"
+            );
+            broadcaster.send(change);
+        } else {
+            tracing::warn!(
+                payload = notification.payload(),
+                "invalid notification payload"
+            );
+        }
+    }
 }
 
 /// Mask the password portion of a database URL for safe logging.
