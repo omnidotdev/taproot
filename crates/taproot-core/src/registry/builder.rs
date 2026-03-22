@@ -11,6 +11,7 @@ use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstra
 use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
 
+use super::federation;
 use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
 use super::scalars::{map_udt_to_graphql, needs_custom_scalar};
 use super::types::SchemaOptions;
@@ -84,6 +85,9 @@ pub fn build_schema(
     // Collect all tables across schemas for relationship resolution
     let all_tables: Vec<&TableInfo> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
 
+    // Federation entity map for resolving _entities queries
+    let mut entity_map = federation::EntityMap::new();
+
     // Register enum types
     for introspected in &schemas {
         for enum_info in &introspected.enums {
@@ -124,6 +128,25 @@ pub fn build_schema(
             let object =
                 build_object_type(&type_name, table, &all_tables, &enum_names, db, options);
             schema_builder = schema_builder.register(object);
+
+            // Register federation entity mapping
+            if options.federation
+                && let Some(pk) = &table.primary_key
+            {
+                let pk_cols: Vec<(String, String)> = pk
+                    .columns
+                    .iter()
+                    .map(|c| (to_camel_case(c), c.clone()))
+                    .collect();
+                entity_map.register(
+                    &type_name,
+                    federation::EntityInfo {
+                        schema: introspected.name.clone(),
+                        table: table.name.clone(),
+                        pk_columns: pk_cols,
+                    },
+                );
+            }
 
             // Register per-table condition input type
             let condition_input = filters::build_table_condition(table, &type_name);
@@ -219,6 +242,89 @@ pub fn build_schema(
 
     if options.federation {
         schema_builder = schema_builder.enable_federation();
+
+        let entity_map = Arc::new(entity_map);
+        let db_for_entities = Arc::clone(db);
+
+        schema_builder = schema_builder.entity_resolver(move |ctx| {
+            let entity_map = Arc::clone(&entity_map);
+            let db = Arc::clone(&db_for_entities);
+
+            FieldFuture::new(async move {
+                let representations = ctx.args.try_get("representations")?.list()?;
+                let mut values = Vec::new();
+
+                for item in representations.iter() {
+                    let item = item.object()?;
+                    let typename = item
+                        .try_get("__typename")
+                        .and_then(|v| v.string())
+                        .map_err(|_| {
+                            async_graphql::Error::new("missing __typename in representation")
+                        })?;
+
+                    let Some(entity_info) = entity_map.get(typename) else {
+                        return Err(async_graphql::Error::new(format!(
+                            "unknown entity type: {typename}"
+                        )));
+                    };
+
+                    // Build filter from key fields
+                    let mut filter_parts = Vec::new();
+                    for (arg_name, col_name) in &entity_info.pk_columns {
+                        let key_value = item.try_get(arg_name).map_err(|_| {
+                            async_graphql::Error::new(format!(
+                                "missing key field {arg_name} in representation for {typename}"
+                            ))
+                        })?;
+                        let json_value = gql_value_to_json(key_value.as_value());
+                        filter_parts.push(FilterExpr::Eq {
+                            column: col_name.clone(),
+                            value: json_value,
+                        });
+                    }
+
+                    let filter = if filter_parts.len() == 1 {
+                        filter_parts.remove(0)
+                    } else {
+                        FilterExpr::And(filter_parts)
+                    };
+
+                    let mut plan = PlanNode::Scan {
+                        schema: entity_info.schema.clone(),
+                        table: entity_info.table.clone(),
+                        filter: Some(filter),
+                        order_by: None,
+                        limit: Some(1),
+                        offset: None,
+                        selections: vec![],
+                    };
+
+                    // Apply on_plan hooks
+                    if let Ok(store) = ctx.data::<PluginStore>() {
+                        for plugin in store.0.iter() {
+                            plugin.on_plan(&mut plan);
+                        }
+                    }
+
+                    let rows = execute_plan(&plan, &db).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    if let Some(row) = rows.into_iter().next() {
+                        let obj = row.get("row_to_json").cloned().unwrap_or(row);
+                        values.push(
+                            FieldValue::value(serde_json_to_gql_value(&obj))
+                                .with_type(typename.to_string()),
+                        );
+                    } else {
+                        values.push(FieldValue::NULL.with_type(typename.to_string()));
+                    }
+                }
+
+                Ok(Some(FieldValue::list(values)))
+            })
+        });
     }
 
     schema_builder
@@ -484,6 +590,14 @@ fn build_object_type(
 
             object = object.field(field);
         }
+    }
+
+    // Mark entity types with @key for federation
+    if options.federation
+        && let Some(pk) = &table.primary_key
+    {
+        let key_fields: Vec<String> = pk.columns.iter().map(|c| to_camel_case(c)).collect();
+        object = object.key(key_fields.join(" "));
     }
 
     object
