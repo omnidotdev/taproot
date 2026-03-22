@@ -4,6 +4,7 @@ pub mod tags;
 pub use smart_comments::SmartCommentsPlugin;
 
 use crate::introspect::{IntrospectedSchema, TableInfo};
+use crate::planner::PlanNode;
 
 /// Extension point for customizing Taproot's schema generation pipeline.
 ///
@@ -22,6 +23,12 @@ pub trait Plugin: Send + Sync {
     /// Plugins can mutate the schema representation — rename tables/columns,
     /// remove items, or attach metadata via the comment field
     fn on_introspect(&self, _schema: &mut IntrospectedSchema) {}
+
+    /// Called after the query plan is built, before SQL execution.
+    ///
+    /// Plugins can modify the plan tree — inject filters (e.g. RLS/tenant
+    /// isolation), rewrite nodes, or add logging markers
+    fn on_plan(&self, _plan: &mut PlanNode) {}
 
     /// Filter tables/views from the schema.
     ///
