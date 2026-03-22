@@ -446,6 +446,14 @@ pub fn build_schema(
         });
     }
 
+    if options.max_depth > 0 {
+        schema_builder = schema_builder.limit_depth(options.max_depth);
+    }
+
+    if options.max_complexity > 0 {
+        schema_builder = schema_builder.limit_complexity(options.max_complexity);
+    }
+
     schema_builder
         .finish()
         .map_err(|e| Error::Schema(e.to_string()))

@@ -14,6 +14,10 @@ pub struct SchemaOptions {
     pub federation: bool,
     /// Enable GraphQL subscriptions
     pub subscriptions: bool,
+    /// Maximum query depth (0 = unlimited)
+    pub max_depth: usize,
+    /// Maximum query complexity (0 = unlimited)
+    pub max_complexity: usize,
 }
 
 impl Default for SchemaOptions {
@@ -24,6 +28,8 @@ impl Default for SchemaOptions {
             max_page_size: 100,
             federation: false,
             subscriptions: false,
+            max_depth: 15,
+            max_complexity: 1000,
         }
     }
 }
@@ -40,5 +46,7 @@ mod tests {
         assert_eq!(opts.max_page_size, 100);
         assert!(!opts.federation);
         assert!(!opts.subscriptions);
+        assert_eq!(opts.max_depth, 15);
+        assert_eq!(opts.max_complexity, 1000);
     }
 }

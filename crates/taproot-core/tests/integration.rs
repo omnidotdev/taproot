@@ -1977,3 +1977,46 @@ async fn taproot_as_lattice_subgraph() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+#[tokio::test]
+async fn query_depth_limit_enforced() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let options = SchemaOptions {
+        max_depth: 3,
+        ..Default::default()
+    };
+
+    let gql_schema = build_schema(&introspected, &db_arc, &options, &[], None)
+        .expect("schema build");
+
+    // This query is 5 levels deep -- should be rejected
+    let result = gql_schema
+        .execute(r"{ users(first: 1) { edges { node { postsByAuthorId(first: 1) { edges { node { title } } } } } } }")
+        .await;
+
+    assert!(!result.errors.is_empty(), "deep query should be rejected");
+    assert!(
+        result.errors[0].message.to_lowercase().contains("too deep"),
+        "error should mention depth: {:?}",
+        result.errors
+    );
+
+    teardown_test_schema(&db, &schema_name).await;
+}
