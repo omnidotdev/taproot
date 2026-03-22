@@ -1464,6 +1464,9 @@ fn register_mutation_types(
     let omit_update = omit_ops.contains("update");
     let omit_delete = omit_ops.contains("delete");
 
+    let plural_type_name = pluralize(type_name);
+    let plural_field_name = pluralize(table_field_name);
+
     if !omit_create {
         schema_builder =
             schema_builder.register(mutations::build_on_conflict_input(type_name));
@@ -1475,6 +1478,16 @@ fn register_mutation_types(
             type_name,
         ));
         mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db));
+
+        // Bulk create
+        schema_builder = schema_builder
+            .register(mutations::build_bulk_create_input(type_name, &plural_type_name));
+        schema_builder = schema_builder.register(build_bulk_mutation_payload(
+            &format!("Create{plural_type_name}Bulk"),
+            &plural_field_name,
+            type_name,
+        ));
+        mutation = mutation.field(build_bulk_create_mutation(table, type_name, &plural_field_name, db));
     }
 
     if !omit_update {
@@ -1489,6 +1502,16 @@ fn register_mutation_types(
         ));
         mutation =
             mutation.field(build_update_mutation(table, type_name, table_field_name, pk_cols, db));
+
+        // Bulk update
+        schema_builder = schema_builder
+            .register(mutations::build_bulk_update_input(type_name, &plural_type_name));
+        schema_builder = schema_builder.register(build_bulk_mutation_payload(
+            &format!("Update{plural_type_name}Bulk"),
+            &plural_field_name,
+            type_name,
+        ));
+        mutation = mutation.field(build_bulk_update_mutation(table, type_name, &plural_field_name, db));
     }
 
     if !omit_delete {
@@ -1501,6 +1524,16 @@ fn register_mutation_types(
         ));
         mutation =
             mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_cols, db));
+
+        // Bulk delete
+        schema_builder = schema_builder
+            .register(mutations::build_bulk_delete_input(type_name, &plural_type_name));
+        schema_builder = schema_builder.register(build_bulk_mutation_payload(
+            &format!("Delete{plural_type_name}Bulk"),
+            &plural_field_name,
+            type_name,
+        ));
+        mutation = mutation.field(build_bulk_delete_mutation(table, type_name, &plural_field_name, db));
     }
 
     (schema_builder, mutation)
@@ -1555,6 +1588,347 @@ fn build_mutation_payload(
     ));
 
     payload
+}
+
+/// Build a bulk mutation payload object type with `clientMutationId`,
+/// `affectedRows`, and a list entity field.
+fn build_bulk_mutation_payload(
+    prefix: &str,
+    entity_field_name: &str,
+    entity_type_name: &str,
+) -> Object {
+    let payload_name = format!("{prefix}Payload");
+    let field_name = entity_field_name.to_string();
+    let entity_type = entity_type_name.to_string();
+
+    let field_name_clone = field_name.clone();
+
+    let mut payload = Object::new(&payload_name);
+
+    payload = payload.field(Field::new(
+        "clientMutationId",
+        TypeRef::named(TypeRef::STRING),
+        |ctx| {
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    Ok(map.get("clientMutationId").cloned().map(FieldValue::value))
+                } else {
+                    Ok(None)
+                }
+            })
+        },
+    ));
+
+    payload = payload.field(Field::new(
+        "affectedRows",
+        TypeRef::named_nn(TypeRef::INT),
+        |ctx| {
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    Ok(map.get("affectedRows").cloned().map(FieldValue::value))
+                } else {
+                    Ok(Some(FieldValue::value(async_graphql::Value::Number(0.into()))))
+                }
+            })
+        },
+    ));
+
+    payload = payload.field(Field::new(
+        field_name,
+        TypeRef::named_nn_list_nn(&entity_type),
+        move |ctx| {
+            let field_name = field_name_clone.clone();
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    match map.get(field_name.as_str()).cloned() {
+                        Some(async_graphql::Value::List(items)) => {
+                            Ok(Some(FieldValue::list(items.into_iter().map(FieldValue::value))))
+                        }
+                        _ => Ok(Some(FieldValue::list(std::iter::empty::<FieldValue<'_>>()))),
+                    }
+                } else {
+                    Ok(Some(FieldValue::list(std::iter::empty::<FieldValue<'_>>())))
+                }
+            })
+        },
+    ));
+
+    payload
+}
+
+/// Build a `create{Types}` bulk create mutation field.
+#[allow(clippy::too_many_lines)]
+fn build_bulk_create_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    entity_field_name: &str,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let plural_type = pluralize(type_name);
+    let field_name = format!("create{plural_type}");
+    let input_type_name = format!("Create{plural_type}BulkInput");
+    let payload_type_name = format!("Create{plural_type}BulkPayload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let entity_field = entity_field_name.to_string();
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let entity_field = entity_field.clone();
+
+            FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let objects = input_json
+                    .get("objects")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut results = Vec::with_capacity(objects.len());
+
+                for obj in &objects {
+                    let (sql, params) =
+                        mutations::create_to_sql(obj, &table_info, &schema_name);
+
+                    let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    let row = rows
+                        .into_iter()
+                        .next()
+                        .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                        .unwrap_or(serde_json::Value::Null);
+
+                    results.push(serde_json_to_gql_value(&row));
+                }
+
+                let affected_rows = results.len();
+
+                let mut payload = async_graphql::indexmap::IndexMap::new();
+                payload.insert(
+                    async_graphql::Name::new("clientMutationId"),
+                    serde_json_to_gql_value(&client_mutation_id),
+                );
+                payload.insert(
+                    async_graphql::Name::new("affectedRows"),
+                    async_graphql::Value::from(i64::try_from(affected_rows).unwrap_or_default()),
+                );
+                payload.insert(
+                    async_graphql::Name::new(&entity_field),
+                    async_graphql::Value::List(results),
+                );
+
+                Ok(Some(FieldValue::value(async_graphql::Value::Object(payload))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build an `update{Types}` bulk update mutation field.
+#[allow(clippy::too_many_lines)]
+fn build_bulk_update_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    entity_field_name: &str,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let plural_type = pluralize(type_name);
+    let field_name = format!("update{plural_type}");
+    let input_type_name = format!("Update{plural_type}BulkInput");
+    let payload_type_name = format!("Update{plural_type}BulkPayload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let entity_field = entity_field_name.to_string();
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let entity_field = entity_field.clone();
+
+            FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let where_condition = input_json
+                    .get("where")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let patch = input_json
+                    .get("patch")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                // Convert condition to filter expression and compile to SQL
+                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+
+                let (filter_sql, filter_params) = filter_expr
+                    .as_ref()
+                    .map_or_else(|| ("TRUE".to_string(), Vec::new()), |expr| crate::planner::compile_filter(expr, 1));
+
+                let (sql, params) = mutations::bulk_update_to_sql(
+                    &patch,
+                    &filter_sql,
+                    &filter_params,
+                    &table_info,
+                    &schema_name,
+                );
+
+                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                    async_graphql::Error::new(format!("database error: {e}"))
+                })?;
+
+                let results: Vec<async_graphql::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        let row = r.get("row_to_json").cloned().unwrap_or_else(|| r.clone());
+                        serde_json_to_gql_value(&row)
+                    })
+                    .collect();
+
+                let affected_rows = results.len();
+
+                let mut payload = async_graphql::indexmap::IndexMap::new();
+                payload.insert(
+                    async_graphql::Name::new("clientMutationId"),
+                    serde_json_to_gql_value(&client_mutation_id),
+                );
+                payload.insert(
+                    async_graphql::Name::new("affectedRows"),
+                    async_graphql::Value::from(i64::try_from(affected_rows).unwrap_or_default()),
+                );
+                payload.insert(
+                    async_graphql::Name::new(&entity_field),
+                    async_graphql::Value::List(results),
+                );
+
+                Ok(Some(FieldValue::value(async_graphql::Value::Object(payload))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build a `delete{Types}` bulk delete mutation field.
+#[allow(clippy::too_many_lines)]
+fn build_bulk_delete_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    entity_field_name: &str,
+    db: &Arc<dyn Database>,
+) -> Field {
+    let plural_type = pluralize(type_name);
+    let field_name = format!("delete{plural_type}");
+    let input_type_name = format!("Delete{plural_type}BulkInput");
+    let payload_type_name = format!("Delete{plural_type}BulkPayload");
+
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let entity_field = entity_field_name.to_string();
+    let db = Arc::clone(db);
+
+    Field::new(
+        &field_name,
+        TypeRef::named(&payload_type_name),
+        move |ctx| {
+            let db = Arc::clone(&db);
+            let schema_name = schema_name.clone();
+            let table_info = table_info.clone();
+            let entity_field = entity_field.clone();
+
+            FieldFuture::new(async move {
+                let rls = ctx.data::<RlsContext>().ok();
+                let input_value = ctx.args.try_get("input")?;
+                let input_json = gql_value_to_json(input_value.as_value());
+
+                let client_mutation_id = input_json
+                    .get("clientMutationId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let where_condition = input_json
+                    .get("where")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+
+                let (filter_sql, filter_params) = filter_expr
+                    .as_ref()
+                    .map_or_else(|| ("TRUE".to_string(), Vec::new()), |expr| crate::planner::compile_filter(expr, 1));
+
+                let (sql, params) = mutations::bulk_delete_to_sql(
+                    &filter_sql,
+                    &filter_params,
+                    &table_info,
+                    &schema_name,
+                );
+
+                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                    async_graphql::Error::new(format!("database error: {e}"))
+                })?;
+
+                let results: Vec<async_graphql::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        let row = r.get("row_to_json").cloned().unwrap_or_else(|| r.clone());
+                        serde_json_to_gql_value(&row)
+                    })
+                    .collect();
+
+                let affected_rows = results.len();
+
+                let mut payload = async_graphql::indexmap::IndexMap::new();
+                payload.insert(
+                    async_graphql::Name::new("clientMutationId"),
+                    serde_json_to_gql_value(&client_mutation_id),
+                );
+                payload.insert(
+                    async_graphql::Name::new("affectedRows"),
+                    async_graphql::Value::from(i64::try_from(affected_rows).unwrap_or_default()),
+                );
+                payload.insert(
+                    async_graphql::Name::new(&entity_field),
+                    async_graphql::Value::List(results),
+                );
+
+                Ok(Some(FieldValue::value(async_graphql::Value::Object(payload))))
+            })
+        },
+    )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
 }
 
 /// Build a `create{Type}` mutation field.

@@ -2413,3 +2413,160 @@ async fn upsert_with_on_conflict() {
     // Role should remain admin since only name was in updateColumns
     assert_eq!(payload["user"]["role"], "admin");
 }
+
+#[tokio::test]
+async fn bulk_create_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createUsers(input: {
+                objects: [
+                    { name: "Charlie", email: "charlie@example.com", role: viewer },
+                    { name: "Dana", email: "dana@example.com", role: editor }
+                ]
+            }) {
+                affectedRows
+                users {
+                    name
+                    email
+                    role
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "bulk create mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["createUsers"];
+    assert_eq!(payload["affectedRows"], 2);
+
+    let users = payload["users"].as_array().expect("users should be an array");
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0]["name"], "Charlie");
+    assert_eq!(users[0]["email"], "charlie@example.com");
+    assert_eq!(users[1]["name"], "Dana");
+    assert_eq!(users[1]["email"], "dana@example.com");
+}
+
+#[tokio::test]
+async fn bulk_update_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Update all viewers to editors (Alice is admin, Bob is editor — neither match)
+    // First add a viewer
+    let setup = r#"
+        mutation {
+            createUser(input: {
+                name: "Charlie",
+                email: "charlie@example.com",
+                role: viewer
+            }) {
+                user { name }
+            }
+        }
+    "#;
+    let setup_result = gql_schema.execute(setup).await;
+    assert!(setup_result.errors.is_empty(), "setup errors: {:?}", setup_result.errors);
+
+    let mutation = r#"
+        mutation {
+            updateUsers(input: {
+                where: { role: { eq: "viewer" } },
+                patch: { role: editor }
+            }) {
+                affectedRows
+                users {
+                    name
+                    role
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "bulk update mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["updateUsers"];
+    assert_eq!(payload["affectedRows"], 1);
+
+    let users = payload["users"].as_array().expect("users should be an array");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["name"], "Charlie");
+    assert_eq!(users[0]["role"], "editor");
+}
+
+#[tokio::test]
+async fn bulk_delete_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Delete all comments by Bob (author_id = 000...002)
+    let mutation = r#"
+        mutation {
+            deleteComments(input: {
+                where: { author_id: { eq: "00000000-0000-0000-0000-000000000002" } }
+            }) {
+                affectedRows
+                comments {
+                    body
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "bulk delete mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["deleteComments"];
+    assert_eq!(payload["affectedRows"], 1);
+
+    let comments = payload["comments"].as_array().expect("comments should be an array");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["body"], "Great post!");
+}
