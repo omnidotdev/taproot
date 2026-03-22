@@ -408,6 +408,11 @@ fn build_object_type(
             continue;
         }
 
+        // Skip if the foreign table was filtered out
+        if !all_tables.iter().any(|t| t.name == fk.foreign_table && t.schema == fk.foreign_schema) {
+            continue;
+        }
+
         let foreign_type_name = to_pascal_case(&singularize(&fk.foreign_table));
         let field_name = format!(
             "{}By{}",
