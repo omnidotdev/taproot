@@ -666,18 +666,16 @@ fn build_list_query(
                     .ok()
                     .and_then(|v| v.string().ok().map(str::to_owned));
 
-                // Build WHERE clause
-                let (where_clause, params) = condition_json
+                // Convert condition JSON to FilterExpr
+                let filter = condition_json
                     .as_ref()
-                    .map_or_else(
-                        || (String::new(), vec![]),
-                        |c| filters::condition_to_sql(c, &table_info, 0),
-                    );
+                    .and_then(|c| condition_to_filter(c, &table_info.columns));
 
-                // Build ORDER BY clause
-                let order_clause = order_json
+                // Convert orderBy JSON to OrderByExpr
+                let order_by = order_json
                     .as_ref()
-                    .map_or_else(String::new, |o| ordering::order_by_to_sql(o, &table_info));
+                    .map(|o| order_to_exprs(o, &table_info.columns))
+                    .filter(|v| !v.is_empty());
 
                 // Cursor-based offset
                 let offset = after
@@ -686,22 +684,50 @@ fn build_list_query(
                     .map_or(0, |n| n + 1);
                 let limit = first.unwrap_or(default_page_size).min(max_page_size);
 
-                let schema_table = format!(
-                    "{}.{}",
-                    quote_ident(&schema_name),
-                    quote_ident(&table_name),
-                );
+                // Build plan for data query
+                #[allow(clippy::cast_possible_wrap)]
+                let mut data_plan = PlanNode::Scan {
+                    schema: schema_name.clone(),
+                    table: table_name.clone(),
+                    filter: filter.clone(),
+                    order_by: order_by.clone(),
+                    limit: Some(limit as i64),
+                    offset: Some(offset as i64),
+                    selections: vec![],
+                };
 
-                let (total_count, rows) = execute_connection_queries(
-                    &db,
-                    &schema_table,
-                    &where_clause,
-                    &order_clause,
-                    &params,
-                    limit,
-                    offset,
-                )
-                .await?;
+                apply_on_plan_hooks(&ctx, &mut data_plan);
+
+                // Build plan for count query
+                let mut count_plan = PlanNode::Scan {
+                    schema: schema_name.clone(),
+                    table: table_name.clone(),
+                    filter,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    selections: vec![],
+                };
+
+                apply_on_plan_hooks(&ctx, &mut count_plan);
+
+                let total_count = execute_plan_count(&count_plan, &db)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                let rows = execute_plan(&data_plan, &db)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                // Unwrap row_to_json wrappers
+                let rows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get("row_to_json")
+                            .cloned()
+                            .unwrap_or_else(|| row.clone())
+                    })
+                    .collect();
 
                 let response =
                     connection::build_connection_response(rows, offset, total_count);
