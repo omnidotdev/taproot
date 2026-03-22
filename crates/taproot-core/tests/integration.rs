@@ -8,6 +8,7 @@ use taproot_core::planner::{
 };
 use taproot_core::registry::types::SchemaOptions;
 use taproot_core::subscription::{ChangeBroadcaster, ChangeNotification, ChangeOp};
+use futures_util::StreamExt;
 use taproot_core::{IntrospectOptions, Plugin, build_schema, introspect};
 
 /// Unique schema name per test run to avoid collisions.
@@ -1914,7 +1915,6 @@ async fn subscription_receives_change_notification() {
     });
 
     // The stream should yield Alice's data
-    use futures_util::StreamExt;
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
         .await
         .expect("timeout waiting for subscription")

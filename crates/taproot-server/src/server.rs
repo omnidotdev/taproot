@@ -21,18 +21,24 @@ pub struct AppState {
     pub schema: Arc<Schema>,
     /// Authentication / RLS configuration.
     pub auth: AuthConfig,
+    /// GraphQL endpoint path.
+    pub graphql_path: String,
 }
 
 /// Build the axum router with `GraphQL` and health check routes.
 pub fn build_router(schema: Schema, config: &ServerConfig, auth: &AuthConfig) -> Router {
+    let gql_path = config.graphql_path.clone();
+    let ws_path = format!("{gql_path}/ws");
+
     let state = AppState {
         schema: Arc::new(schema.clone()),
         auth: auth.clone(),
+        graphql_path: gql_path.clone(),
     };
 
     let mut router = Router::new()
-        .route("/graphql", get(graphql_get).post(graphql_post))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema))
+        .route(&gql_path, get(graphql_get).post(graphql_post))
+        .route_service(&ws_path, GraphQLSubscription::new(schema))
         .route("/health", get(health));
 
     if config.playground {
@@ -73,10 +79,10 @@ struct GraphQlGetParams {
 }
 
 /// Serve the `GraphiQL` playground.
-async fn graphiql() -> impl IntoResponse {
+async fn graphiql(State(state): State<AppState>) -> impl IntoResponse {
     Html(
         GraphiQLSource::build()
-            .endpoint("/graphql")
+            .endpoint(&state.graphql_path)
             .finish(),
     )
 }

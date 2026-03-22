@@ -77,6 +77,9 @@ pub struct ServerConfig {
     /// Listen address in `host:port` format.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// GraphQL endpoint path.
+    #[serde(default = "default_graphql_path")]
+    pub graphql_path: String,
     /// Enable the `GraphiQL` playground at `GET /`.
     #[serde(default = "default_playground")]
     pub playground: bool,
@@ -109,6 +112,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            graphql_path: default_graphql_path(),
             playground: default_playground(),
         }
     }
@@ -123,7 +127,11 @@ fn default_schemas() -> Vec<String> {
 }
 
 fn default_listen() -> String {
-    "0.0.0.0:4001".to_string()
+    "0.0.0.0:4000".to_string()
+}
+
+fn default_graphql_path() -> String {
+    "/graphql".to_string()
 }
 
 const fn default_playground() -> bool {
