@@ -1,5 +1,6 @@
 mod builder;
 pub mod connection;
+pub mod federation;
 pub mod filters;
 pub mod loader;
 pub mod mutations;
