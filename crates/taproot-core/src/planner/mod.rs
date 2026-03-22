@@ -1,7 +1,9 @@
+pub mod bridge;
 pub mod compile;
 pub mod executor;
 pub mod plan;
 
+pub use bridge::{condition_to_filter, order_to_exprs};
 pub use compile::{compile_filter, compile_plan, compile_plan_count};
 pub use executor::{execute_batch_lookup, execute_plan, execute_plan_count};
 pub use plan::{FilterExpr, MutationKind, OrderByExpr, OrderDirection, PlanNode};
