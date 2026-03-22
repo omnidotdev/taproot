@@ -191,14 +191,17 @@ pub fn build_schema(
             let edge_type = connection::build_edge_type(&type_name);
             schema_builder = schema_builder.register(edge_type);
 
-            // Singular query (by single-column primary key)
-            if let Some(pk) = &table.primary_key
-                && pk.columns.len() == 1
-            {
-                let pk_col_name = &pk.columns[0];
-                if let Some(pk_col) = table.columns.iter().find(|c| &c.name == pk_col_name) {
+            // Singular query (by primary key)
+            if let Some(pk) = &table.primary_key {
+                let pk_cols: Vec<&ColumnInfo> = pk
+                    .columns
+                    .iter()
+                    .filter_map(|name| table.columns.iter().find(|c| &c.name == name))
+                    .collect();
+
+                if pk_cols.len() == pk.columns.len() {
                     let field =
-                        build_singular_query(table, &type_name, pk_col, &enum_names, db);
+                        build_singular_query(table, &type_name, &pk_cols, &enum_names, db);
                     query = query.field(field);
                 }
             }
@@ -225,15 +228,17 @@ pub fn build_schema(
                 build_list_query(table, &type_name, options, db, &all_tables_owned);
             query = query.field(list_field);
 
-            // Mutations for non-view tables with single-column primary keys
+            // Mutations for non-view tables with primary keys
             if !table.is_view
                 && let Some(pk) = &table.primary_key
-                && pk.columns.len() == 1
             {
-                let pk_col_name = &pk.columns[0];
-                if let Some(pk_col) =
-                    table.columns.iter().find(|c| &c.name == pk_col_name)
-                {
+                let pk_cols: Vec<ColumnInfo> = pk
+                    .columns
+                    .iter()
+                    .filter_map(|name| table.columns.iter().find(|c| &c.name == name).cloned())
+                    .collect();
+
+                if pk_cols.len() == pk.columns.len() {
                     has_mutations = true;
                     let table_field_name = to_camel_case(&singularize(&table.name));
 
@@ -243,7 +248,7 @@ pub fn build_schema(
                         table,
                         &type_name,
                         &table_field_name,
-                        pk_col,
+                        &pk_cols,
                         &enum_names,
                         db,
                     );
@@ -798,43 +803,66 @@ fn build_object_type(
 fn build_singular_query(
     table: &crate::introspect::TableInfo,
     type_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[&ColumnInfo],
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
 ) -> Field {
-    let field_name = to_camel_case(&singularize(&table.name));
-    let (gql_type, _is_array) = resolve_column_type(pk_col, enum_names);
-    let pk_arg_type = TypeRef::named_nn(gql_type);
-    let pk_arg_name = to_camel_case(&pk_col.name);
+    let singular = singularize(&table.name);
+
+    // For composite PKs, generate `userRoleByUserIdAndRoleId` style name
+    let field_name = if pk_cols.len() == 1 {
+        to_camel_case(&singular)
+    } else {
+        let suffix: String = pk_cols.iter().map(|c| to_pascal_case(&c.name)).collect();
+        format!("{}By{suffix}", to_camel_case(&singular))
+    };
+
+    // Collect PK arg metadata: (camelCase arg name, snake_case col name, graphql type)
+    let pk_args: Vec<(String, String, String)> = pk_cols
+        .iter()
+        .map(|col| {
+            let (gql_type, _) = resolve_column_type(col, enum_names);
+            (to_camel_case(&col.name), col.name.clone(), gql_type)
+        })
+        .collect();
 
     let schema_name = table.schema.clone();
     let table_name = table.name.clone();
-    let pk_col_name = pk_col.name.clone();
     let db = Arc::clone(db);
-    let arg_name = pk_arg_name.clone();
+    let pk_args_clone = pk_args.clone();
 
-    Field::new(
+    let mut field = Field::new(
         field_name,
         TypeRef::named(type_name),
         move |ctx| {
             let db = Arc::clone(&db);
             let schema_name = schema_name.clone();
             let table_name = table_name.clone();
-            let pk_col_name = pk_col_name.clone();
-            let arg_name = arg_name.clone();
+            let pk_args = pk_args_clone.clone();
 
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
-                let pk_value = ctx.args.try_get(&arg_name)?;
-                let pk_json = value_accessor_to_json(&pk_value);
+
+                let mut filter_parts = Vec::with_capacity(pk_args.len());
+                for (arg_name, col_name, _) in &pk_args {
+                    let arg_value = ctx.args.try_get(arg_name)?;
+                    let json_value = value_accessor_to_json(&arg_value);
+                    filter_parts.push(FilterExpr::Eq {
+                        column: col_name.clone(),
+                        value: json_value,
+                    });
+                }
+
+                let filter = if filter_parts.len() == 1 {
+                    filter_parts.remove(0)
+                } else {
+                    FilterExpr::And(filter_parts)
+                };
 
                 let mut plan = PlanNode::Scan {
                     schema: schema_name.clone(),
                     table: table_name.clone(),
-                    filter: Some(FilterExpr::Eq {
-                        column: pk_col_name.clone(),
-                        value: pk_json,
-                    }),
+                    filter: Some(filter),
                     order_by: None,
                     limit: Some(1),
                     offset: None,
@@ -853,8 +881,13 @@ fn build_singular_query(
                     .map(|row| row_json_to_field_value(&row)))
             })
         },
-    )
-    .argument(InputValue::new(pk_arg_name, pk_arg_type))
+    );
+
+    for (arg_name, _, gql_type) in &pk_args {
+        field = field.argument(InputValue::new(arg_name.as_str(), TypeRef::named_nn(gql_type.as_str())));
+    }
+
+    field
 }
 
 /// Build a singular query field for a unique constraint.
@@ -1351,7 +1384,7 @@ fn register_mutation_types(
     table: &TableInfo,
     type_name: &str,
     table_field_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
 ) -> (async_graphql::dynamic::SchemaBuilder, Object) {
@@ -1378,28 +1411,28 @@ fn register_mutation_types(
 
     if !omit_update {
         schema_builder = schema_builder
-            .register(mutations::build_update_input(table, type_name, pk_col, enum_names));
+            .register(mutations::build_update_input(table, type_name, pk_cols, enum_names));
         schema_builder = schema_builder
-            .register(mutations::build_update_patch(table, type_name, pk_col, enum_names));
+            .register(mutations::build_update_patch(table, type_name, pk_cols, enum_names));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Update{type_name}"),
             table_field_name,
             type_name,
         ));
         mutation =
-            mutation.field(build_update_mutation(table, type_name, table_field_name, pk_col, db));
+            mutation.field(build_update_mutation(table, type_name, table_field_name, pk_cols, db));
     }
 
     if !omit_delete {
         schema_builder = schema_builder
-            .register(mutations::build_delete_input(table, type_name, pk_col, enum_names));
+            .register(mutations::build_delete_input(table, type_name, pk_cols, enum_names));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Delete{type_name}"),
             table_field_name,
             type_name,
         ));
         mutation =
-            mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_col, db));
+            mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_cols, db));
     }
 
     (schema_builder, mutation)
@@ -1526,7 +1559,7 @@ fn build_update_mutation(
     table: &TableInfo,
     type_name: &str,
     table_field_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     db: &Arc<dyn Database>,
 ) -> Field {
     let field_name = format!("update{type_name}");
@@ -1536,8 +1569,11 @@ fn build_update_mutation(
     let schema_name = table.schema.clone();
     let table_info = table.clone();
     let table_field = table_field_name.to_string();
-    let pk_col_name = pk_col.name.clone();
-    let pk_field_name = to_camel_case(&pk_col.name);
+    // Store (camelCase field name, snake_case column name) pairs
+    let pk_mappings: Vec<(String, String)> = pk_cols
+        .iter()
+        .map(|c| (to_camel_case(&c.name), c.name.clone()))
+        .collect();
     let db = Arc::clone(db);
 
     Field::new(
@@ -1548,8 +1584,7 @@ fn build_update_mutation(
             let schema_name = schema_name.clone();
             let table_info = table_info.clone();
             let table_field = table_field.clone();
-            let pk_col_name = pk_col_name.clone();
-            let pk_field_name = pk_field_name.clone();
+            let pk_mappings = pk_mappings.clone();
 
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
@@ -1561,10 +1596,16 @@ fn build_update_mutation(
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let pk_value = input_json
-                    .get(&pk_field_name)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let pk_columns: Vec<(String, serde_json::Value)> = pk_mappings
+                    .iter()
+                    .map(|(field_name, col_name)| {
+                        let value = input_json
+                            .get(field_name)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        (col_name.clone(), value)
+                    })
+                    .collect();
 
                 let patch = input_json
                     .get("patch")
@@ -1572,8 +1613,7 @@ fn build_update_mutation(
                     .unwrap_or(serde_json::Value::Null);
 
                 let (sql, params) = mutations::update_to_sql(
-                    &pk_col_name,
-                    &pk_value,
+                    &pk_columns,
                     &patch,
                     &table_info,
                     &schema_name,
@@ -1609,7 +1649,7 @@ fn build_delete_mutation(
     table: &TableInfo,
     type_name: &str,
     table_field_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     db: &Arc<dyn Database>,
 ) -> Field {
     let field_name = format!("delete{type_name}");
@@ -1619,8 +1659,10 @@ fn build_delete_mutation(
     let schema_name = table.schema.clone();
     let table_info = table.clone();
     let table_field = table_field_name.to_string();
-    let pk_col_name = pk_col.name.clone();
-    let pk_field_name = to_camel_case(&pk_col.name);
+    let pk_mappings: Vec<(String, String)> = pk_cols
+        .iter()
+        .map(|c| (to_camel_case(&c.name), c.name.clone()))
+        .collect();
     let db = Arc::clone(db);
 
     Field::new(
@@ -1631,8 +1673,7 @@ fn build_delete_mutation(
             let schema_name = schema_name.clone();
             let table_info = table_info.clone();
             let table_field = table_field.clone();
-            let pk_col_name = pk_col_name.clone();
-            let pk_field_name = pk_field_name.clone();
+            let pk_mappings = pk_mappings.clone();
 
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
@@ -1644,14 +1685,19 @@ fn build_delete_mutation(
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let pk_value = input_json
-                    .get(&pk_field_name)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let pk_columns: Vec<(String, serde_json::Value)> = pk_mappings
+                    .iter()
+                    .map(|(field_name, col_name)| {
+                        let value = input_json
+                            .get(field_name)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        (col_name.clone(), value)
+                    })
+                    .collect();
 
                 let (sql, params) = mutations::delete_to_sql(
-                    &pk_col_name,
-                    &pk_value,
+                    &pk_columns,
                     &table_info,
                     &schema_name,
                 );

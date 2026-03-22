@@ -2020,3 +2020,242 @@ async fn query_depth_limit_enforced() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+// --- Composite primary key tests ---
+
+/// Set up a schema with a composite PK join table for testing.
+async fn setup_composite_pk_schema(db: &dyn Database, schema: &str) {
+    let ddl = [
+        &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
+        &format!(
+            "CREATE TABLE \"{schema}\".users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL
+            )"
+        ),
+        &format!(
+            "CREATE TABLE \"{schema}\".roles (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL
+            )"
+        ),
+        &format!(
+            "CREATE TABLE \"{schema}\".user_roles (
+                user_id UUID NOT NULL REFERENCES \"{schema}\".users(id),
+                role_id UUID NOT NULL REFERENCES \"{schema}\".roles(id),
+                granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, role_id)
+            )"
+        ),
+    ];
+
+    for stmt in &ddl {
+        db.query_raw(stmt).await.expect("DDL statement failed");
+    }
+
+    let seed = [
+        &format!(
+            "INSERT INTO \"{schema}\".users (id, name) VALUES \
+             ('00000000-0000-0000-0000-000000000001', 'Alice'), \
+             ('00000000-0000-0000-0000-000000000002', 'Bob')"
+        ) as &str,
+        &format!(
+            "INSERT INTO \"{schema}\".roles (id, name) VALUES \
+             ('a0000000-0000-0000-0000-000000000001', 'admin'), \
+             ('a0000000-0000-0000-0000-000000000002', 'editor')"
+        ),
+        &format!(
+            "INSERT INTO \"{schema}\".user_roles (user_id, role_id) VALUES \
+             ('00000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001')"
+        ),
+    ];
+
+    for stmt in &seed {
+        db.query_raw(stmt).await.expect("Seed statement failed");
+    }
+}
+
+async fn build_composite_test_schema(
+    db: &SqlxBackend,
+    schema_name: &str,
+) -> async_graphql::dynamic::Schema {
+    let options = IntrospectOptions {
+        schemas: vec![schema_name.to_string()],
+        exclude_tables: Vec::new(),
+        smart_comments: true,
+    };
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let introspected = introspect(db_arc.as_ref(), &options)
+        .await
+        .expect("introspection failed");
+
+    build_schema(
+        &introspected,
+        &db_arc,
+        &SchemaOptions::default(),
+        &[],
+        None,
+    )
+    .expect("schema build failed")
+}
+
+#[tokio::test]
+async fn composite_pk_create_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_composite_pk_schema(&db, &schema_name).await;
+    let gql_schema = build_composite_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createUserRole(input: {
+                userId: "00000000-0000-0000-0000-000000000002",
+                roleId: "a0000000-0000-0000-0000-000000000002"
+            }) {
+                userRole {
+                    userId
+                    roleId
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "composite PK create mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["createUserRole"];
+    assert_eq!(payload["userRole"]["userId"], "00000000-0000-0000-0000-000000000002");
+    assert_eq!(payload["userRole"]["roleId"], "a0000000-0000-0000-0000-000000000002");
+}
+
+#[tokio::test]
+async fn composite_pk_update_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_composite_pk_schema(&db, &schema_name).await;
+    let gql_schema = build_composite_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            updateUserRole(input: {
+                userId: "00000000-0000-0000-0000-000000000001",
+                roleId: "a0000000-0000-0000-0000-000000000001",
+                patch: {
+                    grantedAt: "2025-01-01T00:00:00Z"
+                }
+            }) {
+                userRole {
+                    userId
+                    roleId
+                    grantedAt
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "composite PK update mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["updateUserRole"];
+    assert_eq!(payload["userRole"]["userId"], "00000000-0000-0000-0000-000000000001");
+    assert_eq!(payload["userRole"]["roleId"], "a0000000-0000-0000-0000-000000000001");
+}
+
+#[tokio::test]
+async fn composite_pk_delete_mutation() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_composite_pk_schema(&db, &schema_name).await;
+    let gql_schema = build_composite_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            deleteUserRole(input: {
+                userId: "00000000-0000-0000-0000-000000000001",
+                roleId: "a0000000-0000-0000-0000-000000000001"
+            }) {
+                userRole {
+                    userId
+                    roleId
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "composite PK delete mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    assert!(!data["deleteUserRole"]["userRole"].is_null(), "deleted row should be returned");
+}
+
+#[tokio::test]
+async fn composite_pk_singular_query() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_composite_pk_schema(&db, &schema_name).await;
+    let gql_schema = build_composite_test_schema(&db, &schema_name).await;
+
+    // Composite PK singular query: userRoleByUserIdAndRoleId
+    let query = r#"{
+        userRoleByUserIdAndRoleId(
+            userId: "00000000-0000-0000-0000-000000000001",
+            roleId: "a0000000-0000-0000-0000-000000000001"
+        ) {
+            userId
+            roleId
+        }
+    }"#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "composite PK singular query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    assert_eq!(
+        data["userRoleByUserIdAndRoleId"]["userId"],
+        "00000000-0000-0000-0000-000000000001"
+    );
+}

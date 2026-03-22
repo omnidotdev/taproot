@@ -50,7 +50,7 @@ pub fn build_create_input(
 pub fn build_update_input(
     _table: &TableInfo,
     type_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Update{type_name}Input");
@@ -62,10 +62,12 @@ pub fn build_update_input(
         TypeRef::named(TypeRef::STRING),
     ));
 
-    // PK field is always required
-    let pk_field_name = to_camel_case(&pk_col.name);
-    let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
-    input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    // All PK fields are required
+    for pk_col in pk_cols {
+        let pk_field_name = to_camel_case(&pk_col.name);
+        let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
+        input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    }
 
     // Patch field
     input = input.field(InputValue::new("patch", TypeRef::named_nn(&patch_type_name)));
@@ -79,14 +81,16 @@ pub fn build_update_input(
 pub fn build_update_patch(
     table: &TableInfo,
     type_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
     let patch_name = format!("Update{type_name}Patch");
     let mut patch = InputObject::new(&patch_name);
 
+    let pk_names: HashSet<&str> = pk_cols.iter().map(|c| c.name.as_str()).collect();
+
     for col in &table.columns {
-        if col.is_generated || col.name == pk_col.name {
+        if col.is_generated || pk_names.contains(col.name.as_str()) {
             continue;
         }
 
@@ -105,7 +109,7 @@ pub fn build_update_patch(
 pub fn build_delete_input(
     _table: &TableInfo,
     type_name: &str,
-    pk_col: &ColumnInfo,
+    pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Delete{type_name}Input");
@@ -116,9 +120,11 @@ pub fn build_delete_input(
         TypeRef::named(TypeRef::STRING),
     ));
 
-    let pk_field_name = to_camel_case(&pk_col.name);
-    let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
-    input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    for pk_col in pk_cols {
+        let pk_field_name = to_camel_case(&pk_col.name);
+        let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
+        input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    }
 
     input
 }
@@ -216,25 +222,27 @@ pub fn create_to_sql(
 
 /// Generate an `UPDATE` statement with `RETURNING row_to_json(...)`.
 ///
+/// `pk_columns` contains `(column_name, value)` pairs for the WHERE clause.
+///
 /// Returns the SQL string and parameter values.
 ///
 /// # Panics
 /// Panics if `patch` is not a JSON object.
 #[must_use]
 pub fn update_to_sql(
-    pk_col_name: &str,
-    pk_value: &serde_json::Value,
+    pk_columns: &[(String, serde_json::Value)],
     patch: &serde_json::Value,
     table: &TableInfo,
     schema: &str,
 ) -> (String, Vec<serde_json::Value>) {
     let patch_obj = patch.as_object().expect("patch must be an object");
+    let pk_names: HashSet<&str> = pk_columns.iter().map(|(n, _)| n.as_str()).collect();
     let mut set_clauses = Vec::new();
     let mut params = Vec::new();
     let mut idx = 1usize;
 
     for col in &table.columns {
-        if col.is_generated || col.name == pk_col_name {
+        if col.is_generated || pk_names.contains(col.name.as_str()) {
             continue;
         }
 
@@ -256,20 +264,24 @@ pub fn update_to_sql(
         }
     }
 
-    params.push(pk_value.clone());
+    let mut where_clauses = Vec::new();
+    for (col_name, value) in pk_columns {
+        where_clauses.push(format!("{} = ${idx}", quote_ident(col_name)));
+        params.push(value.clone());
+        idx += 1;
+    }
 
     let sql = format!(
         "WITH updated AS (\
             UPDATE {schema}.{table} \
             SET {sets} \
-            WHERE {pk} = ${pk_idx} \
+            WHERE {where_clause} \
             RETURNING *\
         ) SELECT row_to_json(updated.*) FROM updated",
         schema = quote_ident(schema),
         table = quote_ident(&table.name),
         sets = set_clauses.join(", "),
-        pk = quote_ident(pk_col_name),
-        pk_idx = idx,
+        where_clause = where_clauses.join(" AND "),
     );
 
     (sql, params)
@@ -277,25 +289,32 @@ pub fn update_to_sql(
 
 /// Generate a `DELETE` statement with `RETURNING row_to_json(...)`.
 ///
+/// `pk_columns` contains `(column_name, value)` pairs for the WHERE clause.
+///
 /// Returns the SQL string and parameter values.
 #[must_use]
 pub fn delete_to_sql(
-    pk_col_name: &str,
-    pk_value: &serde_json::Value,
+    pk_columns: &[(String, serde_json::Value)],
     table: &TableInfo,
     schema: &str,
 ) -> (String, Vec<serde_json::Value>) {
-    let params = vec![pk_value.clone()];
+    let mut params = Vec::new();
+    let mut where_clauses = Vec::new();
+
+    for (idx, (col_name, value)) in pk_columns.iter().enumerate() {
+        where_clauses.push(format!("{} = ${}", quote_ident(col_name), idx + 1));
+        params.push(value.clone());
+    }
 
     let sql = format!(
         "WITH deleted AS (\
             DELETE FROM {schema}.{table} \
-            WHERE {pk} = $1 \
+            WHERE {where_clause} \
             RETURNING *\
         ) SELECT row_to_json(deleted.*) FROM deleted",
         schema = quote_ident(schema),
         table = quote_ident(&table.name),
-        pk = quote_ident(pk_col_name),
+        where_clause = where_clauses.join(" AND "),
     );
 
     (sql, params)
@@ -312,6 +331,56 @@ mod tests {
 
     use super::*;
     use crate::introspect::{ColumnInfo, PrimaryKey, TableInfo};
+
+    fn composite_pk_table() -> TableInfo {
+        TableInfo {
+            name: "user_roles".to_string(),
+            schema: "public".to_string(),
+            is_view: false,
+            columns: vec![
+                ColumnInfo {
+                    name: "user_id".to_string(),
+                    data_type: "uuid".to_string(),
+                    udt_name: "uuid".to_string(),
+                    is_nullable: false,
+                    has_default: false,
+                    is_generated: false,
+                    is_array: false,
+                    comment: None,
+                    tags: HashMap::new(),
+                },
+                ColumnInfo {
+                    name: "role_id".to_string(),
+                    data_type: "uuid".to_string(),
+                    udt_name: "uuid".to_string(),
+                    is_nullable: false,
+                    has_default: false,
+                    is_generated: false,
+                    is_array: false,
+                    comment: None,
+                    tags: HashMap::new(),
+                },
+                ColumnInfo {
+                    name: "granted_at".to_string(),
+                    data_type: "timestamp with time zone".to_string(),
+                    udt_name: "timestamptz".to_string(),
+                    is_nullable: false,
+                    has_default: true,
+                    is_generated: false,
+                    is_array: false,
+                    comment: None,
+                    tags: HashMap::new(),
+                },
+            ],
+            primary_key: Some(PrimaryKey {
+                columns: vec!["user_id".to_string(), "role_id".to_string()],
+            }),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            comment: None,
+            tags: HashMap::new(),
+        }
+    }
 
     fn test_table() -> TableInfo {
         TableInfo {
@@ -396,12 +465,14 @@ mod tests {
     #[test]
     fn update_sql_generation() {
         let table = test_table();
-        let pk_value = serde_json::json!("00000000-0000-0000-0000-000000000001");
+        let pk_columns = vec![
+            ("id".to_string(), serde_json::json!("00000000-0000-0000-0000-000000000001")),
+        ];
         let patch = serde_json::json!({
             "name": "Bob"
         });
 
-        let (sql, params) = update_to_sql("id", &pk_value, &patch, &table, "public");
+        let (sql, params) = update_to_sql(&pk_columns, &patch, &table, "public");
 
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("SET"));
@@ -413,16 +484,54 @@ mod tests {
     }
 
     #[test]
+    fn update_sql_composite_pk() {
+        let table = composite_pk_table();
+        let pk_columns = vec![
+            ("user_id".to_string(), serde_json::json!("u1")),
+            ("role_id".to_string(), serde_json::json!("r1")),
+        ];
+        let patch = serde_json::json!({
+            "grantedAt": "2026-01-01"
+        });
+
+        let (sql, params) = update_to_sql(&pk_columns, &patch, &table, "public");
+
+        assert!(sql.contains("\"granted_at\" = $1"));
+        assert!(sql.contains("\"user_id\" = $2"));
+        assert!(sql.contains("AND"));
+        assert!(sql.contains("\"role_id\" = $3"));
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
     fn delete_sql_generation() {
         let table = test_table();
-        let pk_value = serde_json::json!("00000000-0000-0000-0000-000000000001");
+        let pk_columns = vec![
+            ("id".to_string(), serde_json::json!("00000000-0000-0000-0000-000000000001")),
+        ];
 
-        let (sql, params) = delete_to_sql("id", &pk_value, &table, "public");
+        let (sql, params) = delete_to_sql(&pk_columns, &table, "public");
 
         assert!(sql.contains("DELETE FROM"));
         assert!(sql.contains("WHERE \"id\" = $1"));
         assert!(sql.contains("RETURNING"));
         assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn delete_sql_composite_pk() {
+        let table = composite_pk_table();
+        let pk_columns = vec![
+            ("user_id".to_string(), serde_json::json!("u1")),
+            ("role_id".to_string(), serde_json::json!("r1")),
+        ];
+
+        let (sql, params) = delete_to_sql(&pk_columns, &table, "public");
+
+        assert!(sql.contains("\"user_id\" = $1"));
+        assert!(sql.contains("AND"));
+        assert!(sql.contains("\"role_id\" = $2"));
+        assert_eq!(params.len(), 2);
     }
 
     #[test]

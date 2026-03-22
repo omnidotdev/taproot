@@ -91,13 +91,13 @@ pub enum MutationKind {
         input: Value,
     },
     Update {
-        pk_column: String,
-        pk_value: Value,
+        /// Primary key columns: `(column_name, value)` pairs
+        pk_columns: Vec<(String, Value)>,
         patch: Value,
     },
     Delete {
-        pk_column: String,
-        pk_value: Value,
+        /// Primary key columns: `(column_name, value)` pairs
+        pk_columns: Vec<(String, Value)>,
     },
 }
 
