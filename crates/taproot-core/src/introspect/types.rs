@@ -9,6 +9,8 @@ pub struct IntrospectedSchema {
     pub tables: Vec<TableInfo>,
     pub enums: Vec<EnumInfo>,
     pub composite_types: Vec<CompositeTypeInfo>,
+    #[serde(default)]
+    pub functions: Vec<FunctionInfo>,
 }
 
 /// Metadata about a database table or view.
@@ -81,6 +83,25 @@ pub struct CompositeTypeInfo {
     pub name: String,
     pub schema: String,
     pub fields: Vec<ColumnInfo>,
+}
+
+/// A Postgres function discovered during introspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionInfo {
+    /// Function name
+    pub name: String,
+    /// Schema the function lives in
+    pub schema: String,
+    /// Return type UDT name
+    pub return_type: String,
+    /// Whether the function returns SETOF
+    pub returns_set: bool,
+    /// Function volatility: 'i' (immutable), 's' (stable), 'v' (volatile)
+    pub volatility: char,
+    /// Additional parameters after the first table-row param (name, UDT type)
+    pub arguments: Vec<(String, String)>,
+    /// The table name this is a computed field for (if first arg is a table row type)
+    pub computed_table: Option<String>,
 }
 
 /// Options controlling which schemas and tables are introspected.

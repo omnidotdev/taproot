@@ -4,8 +4,8 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 
 use super::types::{
-    ColumnInfo, CompositeTypeInfo, EnumInfo, ForeignKey, IntrospectOptions, IntrospectedSchema,
-    PrimaryKey, TableInfo, UniqueConstraint,
+    ColumnInfo, CompositeTypeInfo, EnumInfo, ForeignKey, FunctionInfo, IntrospectOptions,
+    IntrospectedSchema, PrimaryKey, TableInfo, UniqueConstraint,
 };
 
 /// Introspect the database and return schema metadata for each requested schema.
@@ -25,12 +25,14 @@ pub async fn introspect(
         let tables = fetch_tables(db, schema_name, &options.exclude_tables).await?;
         let enums = fetch_enums(db, schema_name).await?;
         let composite_types = fetch_composite_types(db, schema_name).await?;
+        let functions = fetch_functions(db, schema_name).await?;
 
         schemas.push(IntrospectedSchema {
             name: schema_name.clone(),
             tables,
             enums,
             composite_types,
+            functions,
         });
     }
 
@@ -363,6 +365,141 @@ async fn fetch_composite_types(
     }
 
     Ok(types.into_values().collect())
+}
+
+/// Fetch SQL functions in a schema, identifying computed fields for tables.
+async fn fetch_functions(db: &dyn Database, schema: &str) -> Result<Vec<FunctionInfo>> {
+    let sql = format!(
+        "SELECT
+            p.proname AS name,
+            n.nspname AS schema,
+            pg_catalog.format_type(p.prorettype, NULL) AS return_type,
+            p.proretset AS returns_set,
+            p.provolatile AS volatility,
+            pg_catalog.pg_get_function_arguments(p.oid) AS arg_string,
+            COALESCE(
+                (SELECT c.relname FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_type t ON t.typrelid = c.oid
+                 WHERE t.oid = p.proargtypes[0]
+                 AND c.relnamespace = n.oid),
+                NULL
+            ) AS computed_table
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = '{schema}'
+          AND p.prokind = 'f'
+          AND NOT p.proisagg
+          AND NOT p.proiswindow"
+    );
+
+    let rows = db.query_raw(&sql).await?;
+    let mut functions = Vec::new();
+
+    for row in &rows {
+        let name = str_field(row, "name")?;
+        let func_schema = str_field(row, "schema")?;
+        let return_type = str_field(row, "return_type")?;
+
+        let returns_set = row
+            .get("returns_set")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let volatility_str = str_field(row, "volatility")?;
+        let volatility = volatility_str.chars().next().unwrap_or('v');
+
+        let arg_string = opt_str_field(row, "arg_string").unwrap_or_default();
+        let computed_table = opt_str_field(row, "computed_table");
+
+        // Parse additional arguments (skip the first one if this is a computed field)
+        let arguments = parse_extra_arguments(&arg_string, computed_table.is_some());
+
+        functions.push(FunctionInfo {
+            name,
+            schema: func_schema,
+            return_type,
+            returns_set,
+            volatility,
+            arguments,
+            computed_table,
+        });
+    }
+
+    Ok(functions)
+}
+
+/// Parse the argument string from `pg_get_function_arguments` into (name, type) pairs.
+///
+/// If `skip_first` is true, the first argument (the table row type) is omitted.
+fn parse_extra_arguments(arg_string: &str, skip_first: bool) -> Vec<(String, String)> {
+    if arg_string.is_empty() {
+        return Vec::new();
+    }
+
+    // Split on commas, but respect parentheses (e.g. `numeric(10,2)`)
+    let parts = split_arg_string(arg_string);
+
+    let skip = usize::from(skip_first);
+    parts
+        .into_iter()
+        .skip(skip)
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+
+            // Format is typically "name type" or just "type"
+            // Handle IN/OUT/INOUT/VARIADIC prefixes
+            let part = part
+                .strip_prefix("IN ")
+                .or_else(|| part.strip_prefix("INOUT "))
+                .or_else(|| part.strip_prefix("OUT "))
+                .or_else(|| part.strip_prefix("VARIADIC "))
+                .unwrap_or(part);
+
+            // Split into name and type — last space-separated token group is the type
+            // but types can be multi-word (e.g. "double precision", "character varying")
+            let tokens: Vec<&str> = part.splitn(2, ' ').collect();
+            if tokens.len() == 2 {
+                Some((tokens[0].to_string(), tokens[1].to_string()))
+            } else {
+                // Unnamed parameter
+                Some((String::new(), tokens[0].to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Split an argument string on top-level commas (respecting parentheses).
+fn split_arg_string(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
 }
 
 /// Extract a required string field from a JSON row.
