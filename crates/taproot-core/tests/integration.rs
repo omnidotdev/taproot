@@ -7,6 +7,7 @@ use taproot_core::planner::{
     PlanNode,
 };
 use taproot_core::registry::types::SchemaOptions;
+use taproot_core::subscription::{ChangeBroadcaster, ChangeNotification, ChangeOp};
 use taproot_core::{IntrospectOptions, Plugin, build_schema, introspect};
 
 /// Unique schema name per test run to avoid collisions.
@@ -1818,5 +1819,111 @@ async fn rls_filters_rows_by_context() {
     let _ = db
         .query_raw(&format!("DROP ROLE IF EXISTS \"{role_name}\""))
         .await;
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn subscription_fields_in_schema() {
+    let Some(db) = connect().await else { return };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let broadcaster = ChangeBroadcaster::new(64);
+
+    let options = SchemaOptions {
+        subscriptions: true,
+        ..Default::default()
+    };
+
+    let gql_schema = build_schema(&introspected, &db_arc, &options, &[], Some(&broadcaster))
+        .expect("schema build");
+
+    let sdl = gql_schema.sdl();
+    assert!(
+        sdl.contains("type Subscription"),
+        "SDL should have Subscription type: {sdl}"
+    );
+    assert!(
+        sdl.contains("onUserChanged"),
+        "SDL should have onUserChanged: {sdl}"
+    );
+    assert!(
+        sdl.contains("onPostChanged"),
+        "SDL should have onPostChanged: {sdl}"
+    );
+    assert!(
+        sdl.contains("onCommentChanged"),
+        "SDL should have onCommentChanged: {sdl}"
+    );
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn subscription_receives_change_notification() {
+    let Some(db) = connect().await else { return };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let broadcaster = ChangeBroadcaster::new(64);
+
+    let options = SchemaOptions {
+        subscriptions: true,
+        ..Default::default()
+    };
+
+    let gql_schema = build_schema(&introspected, &db_arc, &options, &[], Some(&broadcaster))
+        .expect("schema build");
+
+    // Start a subscription stream
+    let mut stream =
+        gql_schema.execute_stream("subscription { onUserChanged { name email } }");
+
+    // Send the notification from a spawned task after a short delay,
+    // giving the stream poll time to register the broadcast receiver
+    let bc = broadcaster.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        bc.send(ChangeNotification {
+            table: "users".into(),
+            op: ChangeOp::Update,
+            id: "00000000-0000-0000-0000-000000000001".into(),
+        });
+    });
+
+    // The stream should yield Alice's data
+    use futures_util::StreamExt;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("timeout waiting for subscription")
+        .expect("stream ended");
+
+    assert!(response.errors.is_empty(), "errors: {:?}", response.errors);
+    let data = response.data.into_json().expect("serialize");
+    assert_eq!(data["onUserChanged"]["name"], "Alice");
+    assert_eq!(data["onUserChanged"]["email"], "alice@example.com");
+
     teardown_test_schema(&db, &schema_name).await;
 }

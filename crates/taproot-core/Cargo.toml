@@ -22,3 +22,6 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+futures-util = "0.3.32"
