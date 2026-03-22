@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::db::Database;
 use crate::error::{Error, Result};
 
@@ -82,6 +84,7 @@ async fn fetch_tables(
             unique_constraints,
             foreign_keys,
             comment,
+            tags: HashMap::new(),
         });
     }
 
@@ -135,6 +138,7 @@ async fn fetch_columns(
             is_generated: str_field(row, "is_generated").unwrap_or_default() == "ALWAYS",
             is_array,
             comment: opt_str_field(row, "column_comment"),
+            tags: HashMap::new(),
         });
     }
 
@@ -354,6 +358,7 @@ async fn fetch_composite_types(
             is_generated: false,
             is_array: false,
             comment: None,
+            tags: HashMap::new(),
         });
     }
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Complete introspected schema containing all discovered database objects.
@@ -20,6 +22,9 @@ pub struct TableInfo {
     pub unique_constraints: Vec<UniqueConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
     pub comment: Option<String>,
+    /// Smart tags parsed from Postgres `COMMENT ON` directives
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
 }
 
 /// Metadata about a single column.
@@ -34,6 +39,9 @@ pub struct ColumnInfo {
     pub is_generated: bool,
     pub is_array: bool,
     pub comment: Option<String>,
+    /// Smart tags parsed from Postgres `COMMENT ON` directives
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
 }
 
 /// Primary key constraint for a table.

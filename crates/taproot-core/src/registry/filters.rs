@@ -387,6 +387,8 @@ fn quote_ident(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::introspect::{ColumnInfo, PrimaryKey, TableInfo};
     use serde_json::json;
@@ -407,6 +409,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
                 ColumnInfo {
                     name: "name".to_string(),
@@ -417,6 +420,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
                 ColumnInfo {
                     name: "age".to_string(),
@@ -427,6 +431,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
                 ColumnInfo {
                     name: "active".to_string(),
@@ -437,6 +442,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
             ],
             primary_key: Some(PrimaryKey {
@@ -445,6 +451,7 @@ mod tests {
             unique_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             comment: None,
+            tags: HashMap::new(),
         }
     }
 

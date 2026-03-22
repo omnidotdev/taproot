@@ -1,4 +1,7 @@
+pub mod smart_comments;
 pub mod tags;
+
+pub use smart_comments::SmartCommentsPlugin;
 
 use crate::introspect::{IntrospectedSchema, TableInfo};
 

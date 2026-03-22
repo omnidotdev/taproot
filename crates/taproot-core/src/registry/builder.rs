@@ -225,7 +225,7 @@ fn build_object_type(
         let type_ref = column_to_type_ref(col, enum_names);
 
         let col_name = col.name.clone();
-        let field = Field::new(&field_name, type_ref, move |ctx| {
+        let mut field = Field::new(&field_name, type_ref, move |ctx| {
             let col_name = col_name.clone();
             FieldFuture::new(async move {
                 let parent = ctx.parent_value.try_to_value()?;
@@ -242,6 +242,16 @@ fn build_object_type(
                 }
             })
         });
+
+        // @deprecated tag
+        if let Some(reason) = col.tags.get("deprecated") {
+            let msg = if reason.is_empty() {
+                "Deprecated".to_string()
+            } else {
+                reason.clone()
+            };
+            field = field.deprecation(Some(&msg));
+        }
 
         object = object.field(field);
     }
@@ -914,37 +924,52 @@ fn register_mutation_types(
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
 ) -> (async_graphql::dynamic::SchemaBuilder, Object) {
-    // Register input types
-    schema_builder =
-        schema_builder.register(mutations::build_create_input(table, type_name, enum_names));
-    schema_builder =
-        schema_builder.register(mutations::build_update_input(table, type_name, pk_col, enum_names));
-    schema_builder =
-        schema_builder.register(mutations::build_update_patch(table, type_name, pk_col, enum_names));
-    schema_builder =
-        schema_builder.register(mutations::build_delete_input(table, type_name, pk_col, enum_names));
+    // Check @omit tag for operation-specific exclusions
+    let omit_ops = table
+        .tags
+        .get("omit")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let omit_create = omit_ops.contains("create");
+    let omit_update = omit_ops.contains("update");
+    let omit_delete = omit_ops.contains("delete");
 
-    // Register payload types
-    schema_builder = schema_builder.register(build_mutation_payload(
-        &format!("Create{type_name}"),
-        table_field_name,
-        type_name,
-    ));
-    schema_builder = schema_builder.register(build_mutation_payload(
-        &format!("Update{type_name}"),
-        table_field_name,
-        type_name,
-    ));
-    schema_builder = schema_builder.register(build_mutation_payload(
-        &format!("Delete{type_name}"),
-        table_field_name,
-        type_name,
-    ));
+    if !omit_create {
+        schema_builder =
+            schema_builder.register(mutations::build_create_input(table, type_name, enum_names));
+        schema_builder = schema_builder.register(build_mutation_payload(
+            &format!("Create{type_name}"),
+            table_field_name,
+            type_name,
+        ));
+        mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db));
+    }
 
-    // Register mutation fields
-    mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db));
-    mutation = mutation.field(build_update_mutation(table, type_name, table_field_name, pk_col, db));
-    mutation = mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_col, db));
+    if !omit_update {
+        schema_builder = schema_builder
+            .register(mutations::build_update_input(table, type_name, pk_col, enum_names));
+        schema_builder = schema_builder
+            .register(mutations::build_update_patch(table, type_name, pk_col, enum_names));
+        schema_builder = schema_builder.register(build_mutation_payload(
+            &format!("Update{type_name}"),
+            table_field_name,
+            type_name,
+        ));
+        mutation =
+            mutation.field(build_update_mutation(table, type_name, table_field_name, pk_col, db));
+    }
+
+    if !omit_delete {
+        schema_builder = schema_builder
+            .register(mutations::build_delete_input(table, type_name, pk_col, enum_names));
+        schema_builder = schema_builder.register(build_mutation_payload(
+            &format!("Delete{type_name}"),
+            table_field_name,
+            type_name,
+        ));
+        mutation =
+            mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_col, db));
+    }
 
     (schema_builder, mutation)
 }
@@ -1224,6 +1249,8 @@ fn build_delete_mutation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -1281,6 +1308,7 @@ mod tests {
             is_generated: false,
             is_array: false,
             comment: None,
+            tags: HashMap::new(),
         };
 
         let (gql_type, is_array) = resolve_column_type(&col, &enum_names);

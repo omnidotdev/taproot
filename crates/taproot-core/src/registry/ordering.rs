@@ -84,6 +84,8 @@ fn parse_order_value(value: &str, table: &TableInfo) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::introspect::{ColumnInfo, TableInfo};
 
@@ -103,6 +105,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
                 ColumnInfo {
                     name: "name".to_string(),
@@ -113,6 +116,7 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
                 ColumnInfo {
                     name: "created_at".to_string(),
@@ -123,12 +127,14 @@ mod tests {
                     is_generated: false,
                     is_array: false,
                     comment: None,
+                    tags: HashMap::new(),
                 },
             ],
             primary_key: None,
             unique_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             comment: None,
+            tags: HashMap::new(),
         }
     }
 
