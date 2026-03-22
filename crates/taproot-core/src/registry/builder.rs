@@ -296,6 +296,7 @@ pub fn build_schema(
                         &pk_cols,
                         &enum_names,
                         db,
+                        &all_tables,
                     );
                     schema_builder = sb;
                     mutation = mt;
@@ -1989,6 +1990,124 @@ pub fn pluralize(s: &str) -> String {
 }
 
 
+/// Build nested relationship input types for a create mutation and register
+/// them on the schema builder.
+///
+/// Returns the updated schema builder and the list of nested field descriptors
+/// to attach to the `CreateInput`.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+fn build_nested_rel_inputs(
+    mut schema_builder: async_graphql::dynamic::SchemaBuilder,
+    table: &TableInfo,
+    type_name: &str,
+    enum_names: &HashSet<String>,
+    all_tables: &[&TableInfo],
+) -> (async_graphql::dynamic::SchemaBuilder, Vec<mutations::NestedRelField>) {
+    let mut nested_fields: Vec<mutations::NestedRelField> = Vec::new();
+
+    // Belongs-to: FKs on this table pointing to other tables
+    for fk in &table.foreign_keys {
+        if fk.columns.len() != 1 || fk.foreign_columns.len() != 1 {
+            continue;
+        }
+
+        let related_table = all_tables.iter().find(|t| {
+            t.name == fk.foreign_table && t.schema == fk.foreign_schema
+        });
+        let Some(related_table) = related_table else {
+            continue;
+        };
+
+        let related_type = to_pascal_case(&singularize(&fk.foreign_table));
+        let rel_field_name = format!(
+            "{}By{}",
+            to_camel_case(&singularize(&fk.foreign_table)),
+            to_pascal_case(&fk.columns[0]),
+        );
+        let pascal_rel_field = format!(
+            "{}By{}",
+            to_pascal_case(&singularize(&fk.foreign_table)),
+            to_pascal_case(&fk.columns[0]),
+        );
+
+        let container_name = format!("{type_name}{pascal_rel_field}Input");
+        let connect_name = format!("{type_name}{pascal_rel_field}ConnectInput");
+        let related_create_input = format!("Create{related_type}Input");
+
+        let related_pk_cols: Vec<ColumnInfo> = related_table
+            .primary_key
+            .as_ref()
+            .map(|pk| {
+                pk.columns
+                    .iter()
+                    .filter_map(|name| {
+                        related_table.columns.iter().find(|c| &c.name == name).cloned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if related_pk_cols.is_empty() {
+            continue;
+        }
+
+        schema_builder = schema_builder.register(
+            mutations::build_nested_connect_input(&connect_name, &related_pk_cols, enum_names),
+        );
+        schema_builder = schema_builder.register(
+            mutations::build_nested_belongs_to_input(
+                &container_name,
+                &related_create_input,
+                &connect_name,
+            ),
+        );
+
+        nested_fields.push(mutations::NestedRelField {
+            field_name: rel_field_name,
+            input_type_name: container_name,
+        });
+    }
+
+    // Has-many: FKs on other tables pointing back to this table
+    for other_table in all_tables {
+        for fk in &other_table.foreign_keys {
+            if fk.columns.len() != 1 || fk.foreign_columns.len() != 1 {
+                continue;
+            }
+
+            if fk.foreign_table != table.name || fk.foreign_schema != table.schema {
+                continue;
+            }
+
+            let child_type = to_pascal_case(&singularize(&other_table.name));
+            let rel_field_name = format!(
+                "{}By{}",
+                to_camel_case(&pluralize(&other_table.name)),
+                to_pascal_case(&fk.columns[0]),
+            );
+            let pascal_rel_field = format!(
+                "{}By{}",
+                to_pascal_case(&pluralize(&other_table.name)),
+                to_pascal_case(&fk.columns[0]),
+            );
+
+            let container_name = format!("{type_name}{pascal_rel_field}Input");
+            let child_create_input = format!("Create{child_type}Input");
+
+            schema_builder = schema_builder.register(
+                mutations::build_nested_has_many_input(&container_name, &child_create_input),
+            );
+
+            nested_fields.push(mutations::NestedRelField {
+                field_name: rel_field_name,
+                input_type_name: container_name,
+            });
+        }
+    }
+
+    (schema_builder, nested_fields)
+}
+
 /// Register all mutation input types, payload types, and mutation fields
 /// for a single table.
 #[allow(clippy::too_many_arguments)]
@@ -2001,6 +2120,7 @@ fn register_mutation_types(
     pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
     db: &Arc<dyn Database>,
+    all_tables: &[&TableInfo],
 ) -> (async_graphql::dynamic::SchemaBuilder, Object) {
     // Check @omit tag for operation-specific exclusions
     let omit_ops = table
@@ -2016,10 +2136,14 @@ fn register_mutation_types(
     let plural_field_name = pluralize(table_field_name);
 
     if !omit_create {
+        let (sb, nested_fields) =
+            build_nested_rel_inputs(schema_builder, table, type_name, enum_names, all_tables);
+        schema_builder = sb;
+
         schema_builder =
             schema_builder.register(mutations::build_on_conflict_input(type_name));
         schema_builder =
-            schema_builder.register(mutations::build_create_input(table, type_name, enum_names));
+            schema_builder.register(mutations::build_create_input(table, type_name, enum_names, &nested_fields));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Create{type_name}"),
             table_field_name,

@@ -2974,3 +2974,156 @@ async fn stable_function_not_on_mutations() {
         "stable function should not be exposed as a mutation field"
     );
 }
+
+#[tokio::test]
+async fn nested_create_belongs_to_input_type_exists() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"
+        {
+            __type(name: "CreatePostInput") {
+                inputFields {
+                    name
+                    type { name kind ofType { name } }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "introspection errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields should be an array");
+
+    let field = fields
+        .iter()
+        .find(|f| f["name"] == "userByAuthorId")
+        .expect("CreatePostInput should have a userByAuthorId field");
+
+    assert_eq!(
+        field["type"]["name"].as_str(),
+        Some("PostUserByAuthorIdInput"),
+        "userByAuthorId should have type PostUserByAuthorIdInput"
+    );
+}
+
+#[tokio::test]
+async fn nested_create_has_many_input_type_exists() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"
+        {
+            __type(name: "CreateUserInput") {
+                inputFields {
+                    name
+                    type { name kind ofType { name } }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "introspection errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields should be an array");
+
+    let field = fields
+        .iter()
+        .find(|f| f["name"] == "postsByAuthorId")
+        .expect("CreateUserInput should have a postsByAuthorId field");
+
+    assert_eq!(
+        field["type"]["name"].as_str(),
+        Some("UserPostsByAuthorIdInput"),
+        "postsByAuthorId should have type UserPostsByAuthorIdInput"
+    );
+}
+
+#[tokio::test]
+async fn nested_connect_input_type_has_pk_fields() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"
+        {
+            __type(name: "PostUserByAuthorIdConnectInput") {
+                inputFields {
+                    name
+                    type { name kind ofType { name } }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "introspection errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields should be an array");
+
+    let id_field = fields
+        .iter()
+        .find(|f| f["name"] == "id")
+        .expect("PostUserByAuthorIdConnectInput should have an id field");
+
+    // id should be non-null (required)
+    assert_eq!(
+        id_field["type"]["kind"].as_str(),
+        Some("NON_NULL"),
+        "id field should be non-null"
+    );
+    assert_eq!(
+        id_field["type"]["ofType"]["name"].as_str(),
+        Some("UUID"),
+        "id field inner type should be UUID"
+    );
+}

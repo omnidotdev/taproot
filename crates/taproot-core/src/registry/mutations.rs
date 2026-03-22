@@ -12,6 +12,81 @@ use crate::introspect::{ColumnInfo, TableInfo};
 use super::builder::{to_camel_case, to_pascal_case};
 use super::scalars::map_udt_to_graphql;
 
+/// Descriptor for a nested relationship field on a create input type.
+pub struct NestedRelField {
+    /// GraphQL field name (e.g. `userByAuthorId`, `commentsByPostId`)
+    pub field_name: String,
+    /// GraphQL input type name for this nested field
+    pub input_type_name: String,
+}
+
+/// Build a nested belongs-to input type with `create` and `connect` fields.
+///
+/// For example, `PostUserByAuthorIdInput` has:
+/// - `create: CreateUserInput` (optional)
+/// - `connect: PostUserByAuthorIdConnectInput` (optional)
+#[must_use]
+pub fn build_nested_belongs_to_input(
+    container_type_name: &str,
+    related_create_input: &str,
+    connect_input_name: &str,
+) -> InputObject {
+    let mut input = InputObject::new(container_type_name);
+
+    input = input.field(InputValue::new(
+        "create",
+        TypeRef::named(related_create_input),
+    ));
+
+    input = input.field(InputValue::new(
+        "connect",
+        TypeRef::named(connect_input_name),
+    ));
+
+    input
+}
+
+/// Build a connect input type with the PK fields of the related table as
+/// required fields.
+///
+/// For example, `PostUserByAuthorIdConnectInput` has `id: UUID!`.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn build_nested_connect_input(
+    connect_input_name: &str,
+    pk_cols: &[ColumnInfo],
+    enum_names: &HashSet<String>,
+) -> InputObject {
+    let mut input = InputObject::new(connect_input_name);
+
+    for pk_col in pk_cols {
+        let field_name = to_camel_case(&pk_col.name);
+        let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
+        input = input.field(InputValue::new(field_name, TypeRef::named_nn(gql_type)));
+    }
+
+    input
+}
+
+/// Build a nested has-many input type with a `create` array field.
+///
+/// For example, `PostCommentsByPostIdInput` has:
+/// - `create: [CreateCommentInput]` (optional list)
+#[must_use]
+pub fn build_nested_has_many_input(
+    container_type_name: &str,
+    child_create_input: &str,
+) -> InputObject {
+    let mut input = InputObject::new(container_type_name);
+
+    input = input.field(InputValue::new(
+        "create",
+        TypeRef::named_list(child_create_input),
+    ));
+
+    input
+}
+
 /// Build a `{Type}OnConflict` input type for upsert support.
 ///
 /// Contains `constraint` (the Postgres constraint name) and `updateColumns`
@@ -38,13 +113,15 @@ pub fn build_on_conflict_input(type_name: &str) -> InputObject {
 ///
 /// Required fields are non-nullable columns without defaults. All other
 /// non-generated columns are optional. Includes an optional `onConflict`
-/// field for upsert support.
+/// field for upsert support. Nested relationship fields are appended from
+/// the provided descriptors.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn build_create_input(
     table: &TableInfo,
     type_name: &str,
     enum_names: &HashSet<String>,
+    nested_fields: &[NestedRelField],
 ) -> InputObject {
     let input_name = format!("Create{type_name}Input");
     let on_conflict_type = format!("{type_name}OnConflict");
@@ -63,6 +140,14 @@ pub fn build_create_input(
         let field_name = to_camel_case(&col.name);
         let type_ref = create_input_type_ref(col, enum_names);
         input = input.field(InputValue::new(field_name, type_ref));
+    }
+
+    // Nested relationship fields (belongs-to and has-many)
+    for nested in nested_fields {
+        input = input.field(InputValue::new(
+            &nested.field_name,
+            TypeRef::named(&nested.input_type_name),
+        ));
     }
 
     input = input.field(InputValue::new(
