@@ -182,7 +182,18 @@ pub fn create_to_sql(
 
         if let Some(value) = obj.get(&field_name) {
             columns.push(quote_ident(&col.name));
-            placeholders.push(format!("${idx}"));
+
+            // Enum columns need explicit casts from text
+            if col.data_type == "USER-DEFINED" {
+                placeholders.push(format!(
+                    "${idx}::{}.{}",
+                    quote_ident(schema),
+                    quote_ident(&col.udt_name),
+                ));
+            } else {
+                placeholders.push(format!("${idx}"));
+            }
+
             params.push(value.clone());
             idx += 1;
         }
@@ -229,7 +240,17 @@ pub fn update_to_sql(
 
         let field_name = to_camel_case(&col.name);
         if let Some(value) = patch_obj.get(&field_name) {
-            set_clauses.push(format!("{} = ${idx}", quote_ident(&col.name)));
+            // Enum columns need explicit casts from text
+            if col.data_type == "USER-DEFINED" {
+                set_clauses.push(format!(
+                    "{} = ${idx}::{}.{}",
+                    quote_ident(&col.name),
+                    quote_ident(schema),
+                    quote_ident(&col.udt_name),
+                ));
+            } else {
+                set_clauses.push(format!("{} = ${idx}", quote_ident(&col.name)));
+            }
             params.push(value.clone());
             idx += 1;
         }
