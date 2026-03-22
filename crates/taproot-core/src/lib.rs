@@ -4,6 +4,7 @@ pub mod introspect;
 pub mod planner;
 pub mod plugin;
 pub mod registry;
+pub mod subscription;
 
 pub use introspect::{introspect, IntrospectOptions, IntrospectedSchema};
 pub use planner::{

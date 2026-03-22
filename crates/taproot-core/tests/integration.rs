@@ -1768,7 +1768,7 @@ async fn rls_filters_rows_by_context() {
     };
 
     let request =
-        async_graphql::Request::new(r#"{ users(first: 10) { edges { node { name } } } }"#)
+        async_graphql::Request::new(r"{ users(first: 10) { edges { node { name } } } }")
             .data(rls_ctx);
 
     let result = gql_schema.execute(request).await;
@@ -1794,7 +1794,7 @@ async fn rls_filters_rows_by_context() {
     };
 
     let request_bob =
-        async_graphql::Request::new(r#"{ users(first: 10) { edges { node { name } } } }"#)
+        async_graphql::Request::new(r"{ users(first: 10) { edges { node { name } } } }")
             .data(rls_ctx_bob);
 
     let result_bob = gql_schema.execute(request_bob).await;
