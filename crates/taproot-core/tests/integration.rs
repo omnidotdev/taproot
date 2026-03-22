@@ -648,7 +648,27 @@ async fn delete_mutation() {
 
     let gql_schema = build_test_schema(&db, &schema_name).await;
 
-    // Delete a user with no posts referencing them (delete Bob's posts first)
+    // Delete comment on Draft Post first (FK constraint prevents deleting the post otherwise)
+    let delete_comment = r#"
+        mutation {
+            deleteComment(input: {
+                id: "20000000-0000-0000-0000-000000000003"
+            }) {
+                comment {
+                    body
+                }
+            }
+        }
+    "#;
+
+    let comment_result = gql_schema.execute(delete_comment).await;
+    assert!(
+        comment_result.errors.is_empty(),
+        "delete comment errors: {:?}",
+        comment_result.errors
+    );
+
+    // Delete Bob's post now that it has no referencing comments
     let delete_post = r#"
         mutation {
             deletePost(input: {
@@ -668,7 +688,27 @@ async fn delete_mutation() {
         post_result.errors
     );
 
-    // Now delete Bob
+    // Delete Bob's comment on First Post (FK constraint prevents deleting user otherwise)
+    let delete_bob_comment = r#"
+        mutation {
+            deleteComment(input: {
+                id: "20000000-0000-0000-0000-000000000001"
+            }) {
+                comment {
+                    body
+                }
+            }
+        }
+    "#;
+
+    let bob_comment_result = gql_schema.execute(delete_bob_comment).await;
+    assert!(
+        bob_comment_result.errors.is_empty(),
+        "delete Bob's comment errors: {:?}",
+        bob_comment_result.errors
+    );
+
+    // Now delete Bob (no more posts or comments referencing him)
     let delete_user = r#"
         mutation {
             deleteUser(input: {
@@ -1304,7 +1344,8 @@ async fn federation_sdl_contains_key_directives() {
     let gql_schema =
         build_schema(&introspected, &db_arc, &options, &[]).expect("schema build should succeed");
 
-    let sdl = gql_schema.sdl();
+    let sdl = gql_schema
+        .sdl_with_options(async_graphql::SDLExportOptions::new().federation());
 
     teardown_test_schema(&db, &schema_name).await;
 
