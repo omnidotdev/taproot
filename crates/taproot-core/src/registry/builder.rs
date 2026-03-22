@@ -493,14 +493,22 @@ fn build_singular_query(
                 let pk_value = ctx.args.try_get(&arg_name)?;
                 let pk_json = value_accessor_to_json(&pk_value);
 
-                let sql = format!(
-                    "SELECT row_to_json(t.*) FROM {schema}.{table} t WHERE {col} = $1",
-                    schema = quote_ident(&schema_name),
-                    table = quote_ident(&table_name),
-                    col = quote_ident(&pk_col_name),
-                );
+                let mut plan = PlanNode::Scan {
+                    schema: schema_name.clone(),
+                    table: table_name.clone(),
+                    filter: Some(FilterExpr::Eq {
+                        column: pk_col_name.clone(),
+                        value: pk_json,
+                    }),
+                    order_by: None,
+                    limit: Some(1),
+                    offset: None,
+                    selections: vec![],
+                };
 
-                let rows = db.query(&sql, &[pk_json]).await.map_err(|e| {
+                apply_on_plan_hooks(&ctx, &mut plan);
+
+                let rows = execute_plan(&plan, &db).await.map_err(|e| {
                     async_graphql::Error::new(format!("database error: {e}"))
                 })?;
 
