@@ -12,6 +12,8 @@ pub struct SchemaOptions {
     pub max_page_size: usize,
     /// Enable Apollo Federation support
     pub federation: bool,
+    /// Enable GraphQL subscriptions
+    pub subscriptions: bool,
 }
 
 impl Default for SchemaOptions {
@@ -21,6 +23,7 @@ impl Default for SchemaOptions {
             default_page_size: 25,
             max_page_size: 100,
             federation: false,
+            subscriptions: false,
         }
     }
 }
@@ -36,5 +39,6 @@ mod tests {
         assert_eq!(opts.default_page_size, 25);
         assert_eq!(opts.max_page_size, 100);
         assert!(!opts.federation);
+        assert!(!opts.subscriptions);
     }
 }

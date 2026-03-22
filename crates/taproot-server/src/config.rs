@@ -18,6 +18,9 @@ pub struct Config {
     /// Authentication / RLS settings.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Subscription settings.
+    #[serde(default)]
+    pub subscriptions: SubscriptionConfig,
 }
 
 /// Authentication / RLS configuration.
@@ -137,4 +140,28 @@ fn default_claims_setting() -> String {
 
 fn default_default_role() -> String {
     "anonymous".into()
+}
+
+/// Subscription configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionConfig {
+    /// Enable GraphQL subscriptions.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Postgres NOTIFY channel to listen on.
+    #[serde(default = "default_notify_channel")]
+    pub notify_channel: String,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notify_channel: default_notify_channel(),
+        }
+    }
+}
+
+fn default_notify_channel() -> String {
+    "graphql_subscriptions".into()
 }
