@@ -388,7 +388,6 @@ fn build_object_type(
                     let parent_pk_col = parent_pk_col.clone();
 
                     FieldFuture::new(async move {
-                        // Extract the parent PK value
                         let parent = ctx.parent_value.try_to_value()?;
                         let pk_value = if let async_graphql::Value::Object(map) = parent {
                             map.get(parent_pk_col.as_str()).cloned()
@@ -403,7 +402,6 @@ fn build_object_type(
 
                         let pk_json = gql_value_to_json(&pk_value);
 
-                        // Parse pagination args
                         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                         let first = ctx
                             .args
@@ -424,24 +422,56 @@ fn build_object_type(
                             .map_or(0, |n| n + 1);
                         let limit = first.unwrap_or(default_page_size).min(max_page_size);
 
-                        let schema_table = format!(
-                            "{}.{}",
-                            quote_ident(&child_schema),
-                            quote_ident(&child_table_name),
-                        );
+                        let filter = FilterExpr::Eq {
+                            column: child_fk_col.clone(),
+                            value: pk_json,
+                        };
 
-                        let where_clause = format!("{} = $1", quote_ident(&child_fk_col));
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut data_plan = PlanNode::Scan {
+                            schema: child_schema.clone(),
+                            table: child_table_name.clone(),
+                            filter: Some(filter.clone()),
+                            order_by: None,
+                            limit: Some(limit as i64),
+                            offset: Some(offset as i64),
+                            selections: vec![],
+                        };
 
-                        let (total_count, rows) = execute_connection_queries(
-                            &db,
-                            &schema_table,
-                            &where_clause,
-                            "",
-                            &[pk_json],
-                            limit,
-                            offset,
-                        )
-                        .await?;
+                        apply_on_plan_hooks(&ctx, &mut data_plan);
+
+                        let mut count_plan = PlanNode::Scan {
+                            schema: child_schema.clone(),
+                            table: child_table_name.clone(),
+                            filter: Some(filter),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                            selections: vec![],
+                        };
+
+                        apply_on_plan_hooks(&ctx, &mut count_plan);
+
+                        let total_count = execute_plan_count(&count_plan, &db)
+                            .await
+                            .map_err(|e| {
+                                async_graphql::Error::new(format!("database error: {e}"))
+                            })?;
+
+                        let rows = execute_plan(&data_plan, &db)
+                            .await
+                            .map_err(|e| {
+                                async_graphql::Error::new(format!("database error: {e}"))
+                            })?;
+
+                        let rows: Vec<serde_json::Value> = rows
+                            .iter()
+                            .map(|row| {
+                                row.get("row_to_json")
+                                    .cloned()
+                                    .unwrap_or_else(|| row.clone())
+                            })
+                            .collect();
 
                         let response =
                             connection::build_connection_response(rows, offset, total_count);
