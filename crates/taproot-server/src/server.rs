@@ -36,16 +36,12 @@ pub fn build_router(schema: Schema, config: &ServerConfig, auth: &AuthConfig) ->
         graphql_path: gql_path.clone(),
     };
 
-    let mut router = Router::new()
-        .route(&gql_path, get(graphql_get).post(graphql_post))
+    Router::new()
+        .route(&gql_path, get(graphql_get_or_playground).post(graphql_post))
         .route_service(&ws_path, GraphQLSubscription::new(schema))
-        .route("/health", get(health));
-
-    if config.playground {
-        router = router.route("/", get(graphiql));
-    }
-
-    router.layer(CorsLayer::permissive()).with_state(state)
+        .route("/health", get(health))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 /// Handle `POST /graphql` requests.
@@ -60,31 +56,43 @@ async fn graphql_post(
     Json(response)
 }
 
-/// Handle `GET /graphql` requests (query via query string).
-async fn graphql_get(
+/// Handle `GET /graphql` — serve `GraphiQL` for browsers, execute query for API clients.
+async fn graphql_get_or_playground(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    req: axum::extract::Query<GraphQlGetParams>,
-) -> impl IntoResponse {
+    axum::extract::Query(params): axum::extract::Query<GraphQlGetParams>,
+) -> axum::response::Response {
+    // Serve GraphiQL if the request accepts HTML and has no query
+    let accepts_html = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"));
+
+    if accepts_html && params.query.is_empty() {
+        return Html(
+            GraphiQLSource::build()
+                .endpoint(&state.graphql_path)
+                .finish(),
+        )
+        .into_response();
+    }
+
+    if params.query.is_empty() {
+        return Json(serde_json::json!({"errors": [{"message": "Missing query parameter"}]}))
+            .into_response();
+    }
+
     let rls = build_rls_context(&state.auth, &headers);
-    let request = async_graphql::Request::new(&req.query).data(rls);
+    let request = async_graphql::Request::new(&params.query).data(rls);
     let response = state.schema.execute(request).await;
-    Json(response)
+    Json(response).into_response()
 }
 
 /// Query parameters for `GET /graphql`.
 #[derive(serde::Deserialize)]
 struct GraphQlGetParams {
+    #[serde(default)]
     query: String,
-}
-
-/// Serve the `GraphiQL` playground.
-async fn graphiql(State(state): State<AppState>) -> impl IntoResponse {
-    Html(
-        GraphiQLSource::build()
-            .endpoint(&state.graphql_path)
-            .finish(),
-    )
 }
 
 /// Health check endpoint.
