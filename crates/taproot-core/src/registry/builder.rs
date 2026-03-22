@@ -9,11 +9,28 @@ use async_graphql::dynamic::{
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::introspect::{ColumnInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
+use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
 
 use super::scalars::{map_udt_to_graphql, needs_custom_scalar};
 use super::types::SchemaOptions;
 use super::{connection, filters, mutations, ordering};
+
+/// Schema-level storage for plugins, accessible by resolvers via `ctx.data()`
+#[derive(Clone)]
+struct PluginStore(Arc<Vec<Arc<dyn Plugin>>>);
+
+/// Apply all plugin `on_plan` hooks to a plan node
+fn apply_on_plan_hooks(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    plan: &mut PlanNode,
+) {
+    if let Ok(store) = ctx.data::<PluginStore>() {
+        for plugin in store.0.iter() {
+            plugin.on_plan(plan);
+        }
+    }
+}
 
 /// Build a dynamic `async_graphql` schema from introspected database metadata.
 ///
@@ -48,6 +65,9 @@ pub fn build_schema(
         });
     }
 
+    // Store plugins for resolver-time access (on_plan hooks)
+    let plugin_store = PluginStore(Arc::new(plugins.to_vec()));
+
     let mut custom_scalars: HashSet<&'static str> = HashSet::new();
     let mut query = Object::new("Query");
 
@@ -56,6 +76,7 @@ pub fn build_schema(
     let mut mutation = Object::new("Mutation");
     let mut has_mutations = false;
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
+    schema_builder = schema_builder.data(plugin_store);
 
     // Collect all tables across schemas for relationship resolution
     let all_tables: Vec<&TableInfo> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
