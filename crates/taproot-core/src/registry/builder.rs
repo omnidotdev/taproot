@@ -2683,7 +2683,9 @@ fn build_create_mutation(
                 });
 
                 let row = if has_nested {
-                    // Use a transaction for nested operations
+                    // Use a transaction for nested operations. If any step
+                    // returns Err, the transaction is implicitly rolled back
+                    // when `tx` is dropped (SqlxTransaction rollback-on-drop).
                     let mut tx = db.begin().await.map_err(|e| {
                         async_graphql::Error::new(format!("transaction error: {e}"))
                     })?;
@@ -2721,7 +2723,7 @@ fn build_create_mutation(
                                 })?;
 
                                 if let Some(connect_val) = nested_obj.get("connect") {
-                                    // Phase 1: Connect — extract PK from connect input, set FK
+                                    // Phase 1: Connect — validate existence, extract PK, set FK
                                     let connect_obj = connect_val.as_object().ok_or_else(|| {
                                         async_graphql::Error::new("connect must be an object")
                                     })?;
@@ -2733,6 +2735,24 @@ fn build_create_mutation(
                                                 "connect input missing required field `{pk_field}`"
                                             ))
                                         })?;
+
+                                        // Validate the referenced record exists
+                                        let check_sql = format!(
+                                            "SELECT 1 FROM {}.{} WHERE {} = $1",
+                                            mutations::quote_ident(&rel.related_schema),
+                                            mutations::quote_ident(&rel.related_table.name),
+                                            mutations::quote_ident(pk_col),
+                                        );
+                                        let check_rows = tx.query(&check_sql, std::slice::from_ref(&pk_value)).await.map_err(|e| {
+                                            async_graphql::Error::new(format!("database error: {e}"))
+                                        })?;
+                                        if check_rows.is_empty() {
+                                            return Err(async_graphql::Error::new(format!(
+                                                "record not found in `{}` with `{}` = {}",
+                                                rel.related_table.name, pk_col, pk_value,
+                                            )));
+                                        }
+
                                         let fk_field = to_camel_case(fk_col);
                                         input_obj.insert(fk_field, pk_value);
                                     }

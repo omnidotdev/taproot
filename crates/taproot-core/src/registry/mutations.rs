@@ -692,7 +692,7 @@ fn renumber_placeholders(sql: &str, start: usize) -> String {
 }
 
 /// Quote a SQL identifier to prevent injection.
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
