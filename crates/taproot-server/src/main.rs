@@ -1,6 +1,3 @@
-mod config;
-mod server;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,6 +7,8 @@ use taproot_core::db::SqlxBackend;
 use taproot_core::introspect::types::IntrospectOptions;
 use taproot_core::subscription::{ChangeBroadcaster, ChangeNotification};
 use taproot_core::{build_schema, introspect};
+use taproot_server::config;
+use taproot_server::server;
 use tracing::info;
 
 /// Taproot — auto-generate a `GraphQL` API from Postgres.
