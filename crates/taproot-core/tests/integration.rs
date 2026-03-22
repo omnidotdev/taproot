@@ -2259,3 +2259,87 @@ async fn composite_pk_singular_query() {
         "00000000-0000-0000-0000-000000000001"
     );
 }
+
+#[tokio::test]
+async fn aggregates_on_connection() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+
+    db.query_raw(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_name}\""))
+        .await
+        .expect("create schema");
+    db.query_raw(&format!(
+        "CREATE TABLE \"{schema_name}\".orders (
+            id SERIAL PRIMARY KEY,
+            amount NUMERIC NOT NULL,
+            quantity INTEGER NOT NULL,
+            label TEXT NOT NULL
+        )"
+    ))
+    .await
+    .expect("create orders table");
+    db.query_raw(&format!(
+        "INSERT INTO \"{schema_name}\".orders (amount, quantity, label) VALUES \
+         (10.5, 2, 'alpha'), \
+         (20.0, 5, 'beta'), \
+         (30.5, 3, 'gamma')"
+    ))
+    .await
+    .expect("seed orders");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let query = r#"{
+        orders(first: 10) {
+            aggregates {
+                count
+                sum { amount quantity }
+                avg { amount }
+                min { amount quantity label }
+                max { amount quantity label }
+            }
+            edges { node { amount quantity } }
+        }
+    }"#;
+
+    let result = gql_schema.execute(query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "aggregates query errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let agg = &data["orders"]["aggregates"];
+
+    assert_eq!(agg["count"], 3);
+
+    // Sum: 10.5 + 20.0 + 30.5 = 61.0; 2 + 5 + 3 = 10
+    let sum_amount: f64 = agg["sum"]["amount"].as_f64().expect("sum.amount");
+    assert!((sum_amount - 61.0).abs() < 0.01, "sum.amount = {sum_amount}");
+    let sum_qty: f64 = agg["sum"]["quantity"].as_f64().expect("sum.quantity");
+    assert!((sum_qty - 10.0).abs() < 0.01, "sum.quantity = {sum_qty}");
+
+    // Avg amount: 61.0 / 3 ≈ 20.333
+    let avg_amount: f64 = agg["avg"]["amount"].as_f64().expect("avg.amount");
+    assert!(
+        (avg_amount - 20.333).abs() < 0.01,
+        "avg.amount = {avg_amount}"
+    );
+
+    // Min
+    let min_amount: f64 = agg["min"]["amount"].as_f64().expect("min.amount");
+    assert!((min_amount - 10.5).abs() < 0.01, "min.amount = {min_amount}");
+    assert_eq!(agg["min"]["label"], "alpha");
+
+    // Max
+    let max_amount: f64 = agg["max"]["amount"].as_f64().expect("max.amount");
+    assert!((max_amount - 30.5).abs() < 0.01, "max.amount = {max_amount}");
+    assert_eq!(agg["max"]["label"], "gamma");
+}

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{
@@ -16,7 +17,7 @@ use super::federation;
 use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
 use super::scalars::map_udt_to_graphql;
 use super::types::SchemaOptions;
-use super::{connection, filters, mutations, ordering};
+use super::{aggregates, connection, filters, mutations, ordering};
 
 /// Schema-level storage for plugins, accessible by resolvers via `ctx.data()`
 #[derive(Clone)]
@@ -184,8 +185,44 @@ pub fn build_schema(
             let order_by_enum = ordering::build_table_order_by(table, &type_name);
             schema_builder = schema_builder.register(order_by_enum);
 
-            // Register connection and edge types
-            let connection_type = connection::build_connection_type(&type_name);
+            // Register aggregate types
+            let agg_type = aggregates::build_aggregates_type(&type_name, &table.columns);
+            schema_builder = schema_builder.register(agg_type);
+
+            if let Some(sum_type) = aggregates::build_sum_type(&type_name, &table.columns) {
+                schema_builder = schema_builder.register(sum_type);
+            }
+            if let Some(avg_type) = aggregates::build_avg_type(&type_name, &table.columns) {
+                schema_builder = schema_builder.register(avg_type);
+            }
+            if let Some(min_type) = aggregates::build_min_type(&type_name, &table.columns) {
+                schema_builder = schema_builder.register(min_type);
+            }
+            if let Some(max_type) = aggregates::build_max_type(&type_name, &table.columns) {
+                schema_builder = schema_builder.register(max_type);
+            }
+
+            // Register connection and edge types (with aggregates field)
+            let agg_type_name = format!("{type_name}Aggregates");
+            let connection_type = connection::build_connection_type(&type_name)
+                .field(Field::new(
+                    "aggregates",
+                    TypeRef::named_nn(&agg_type_name),
+                    |ctx| {
+                        FieldFuture::new(async move {
+                            let parent = ctx.parent_value.try_to_value()?;
+                            if let async_graphql::Value::Object(map) = parent
+                                && let Some(v) = map.get("aggregates")
+                            {
+                                return Ok(Some(FieldValue::value(v.clone())));
+                            }
+
+                            Ok(Some(FieldValue::value(async_graphql::Value::Object(
+                                async_graphql::indexmap::IndexMap::default(),
+                            ))))
+                        })
+                    },
+                ));
             schema_builder = schema_builder.register(connection_type);
 
             let edge_type = connection::build_edge_type(&type_name);
@@ -1123,6 +1160,9 @@ fn build_list_query(
 
                 apply_on_plan_hooks(&ctx, &mut data_plan);
 
+                // Keep a copy of the filter for the aggregate query
+                let agg_filter = filter.clone();
+
                 // Build plan for count query
                 let mut count_plan = PlanNode::Scan {
                     schema: schema_name.clone(),
@@ -1144,6 +1184,27 @@ fn build_list_query(
                     .await
                     .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
 
+                // Run aggregate query with the same filter (ignoring pagination)
+                let mut agg_sql = aggregates::build_aggregate_sql(
+                    &schema_name,
+                    &table_name,
+                    &table_info.columns,
+                );
+                let agg_params = agg_filter.as_ref().map_or_else(Vec::new, |expr| {
+                    let (where_sql, where_params) =
+                        crate::planner::compile_filter(expr, 1);
+                    let _ = write!(agg_sql, " WHERE {where_sql}");
+                    where_params
+                });
+                let agg_rows = db
+                    .query_with_rls(&agg_sql, &agg_params, rls)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+                let agg_json = agg_rows
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| serde_json::json!({"count": 0}));
+
                 // Unwrap row_to_json wrappers
                 let rows: Vec<serde_json::Value> = rows
                     .iter()
@@ -1154,8 +1215,13 @@ fn build_list_query(
                     })
                     .collect();
 
-                let response =
+                let mut response =
                     connection::build_connection_response(rows, offset, total_count);
+
+                // Attach aggregate data to the connection response
+                if let serde_json::Value::Object(ref mut map) = response {
+                    map.insert("aggregates".to_owned(), agg_json);
+                }
 
                 Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
             })

@@ -1,3 +1,4 @@
+pub mod aggregates;
 mod builder;
 pub mod connection;
 pub mod federation;
