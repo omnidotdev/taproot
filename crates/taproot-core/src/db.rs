@@ -7,6 +7,50 @@ use crate::error::{Error, Result};
 /// A database row represented as a JSON object.
 pub type JsonRow = serde_json::Value;
 
+/// Per-request RLS context for setting Postgres role and claims
+#[derive(Debug, Clone)]
+pub struct RlsContext {
+    /// Postgres role to SET LOCAL ROLE to (e.g. "authenticated")
+    pub role: Option<String>,
+    /// JSON string of JWT claims to SET LOCAL
+    pub claims_json: Option<String>,
+    /// Postgres setting name for claims (default: "request.jwt.claims")
+    pub claims_setting: String,
+}
+
+impl Default for RlsContext {
+    fn default() -> Self {
+        Self {
+            role: None,
+            claims_json: None,
+            claims_setting: "request.jwt.claims".into(),
+        }
+    }
+}
+
+impl RlsContext {
+    /// Generate SET LOCAL SQL statements for this context
+    #[must_use]
+    pub fn set_local_statements(&self) -> Vec<String> {
+        let mut stmts = Vec::new();
+
+        if let Some(role) = &self.role {
+            let escaped = role.replace('\'', "''");
+            stmts.push(format!("SET LOCAL ROLE '{escaped}'"));
+        }
+
+        if let Some(claims) = &self.claims_json {
+            let escaped_setting = self.claims_setting.replace('\'', "''");
+            let escaped_claims = claims.replace('\'', "''");
+            stmts.push(format!(
+                "SET LOCAL \"{escaped_setting}\" = '{escaped_claims}'"
+            ));
+        }
+
+        stmts
+    }
+}
+
 /// Abstraction over database access for introspection and query execution.
 #[async_trait]
 pub trait Database: Send + Sync + 'static {
@@ -18,6 +62,17 @@ pub trait Database: Send + Sync + 'static {
 
     /// Execute a raw query with no parameters (used for introspection).
     async fn query_raw(&self, sql: &str) -> Result<Vec<JsonRow>>;
+
+    /// Execute a query within a transaction that has RLS context set via SET LOCAL.
+    /// Falls back to regular query if rls is None or has no statements.
+    async fn query_with_rls(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+        _rls: Option<&RlsContext>,
+    ) -> Result<Vec<JsonRow>> {
+        self.query(sql, params).await
+    }
 }
 
 /// Database backend powered by sqlx with a Postgres connection pool.
@@ -77,6 +132,41 @@ impl Database for SqlxBackend {
     async fn query_raw(&self, sql: &str) -> Result<Vec<JsonRow>> {
         let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         rows.iter().map(row_to_json).collect()
+    }
+
+    async fn query_with_rls(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+        rls: Option<&RlsContext>,
+    ) -> Result<Vec<JsonRow>> {
+        let Some(rls) = rls else {
+            return self.query(sql, params).await;
+        };
+
+        let set_stmts = rls.set_local_statements();
+        if set_stmts.is_empty() {
+            return self.query(sql, params).await;
+        }
+
+        // Run in a transaction with SET LOCAL
+        let mut tx = self.pool.begin().await?;
+
+        for stmt in &set_stmts {
+            sqlx::query(stmt).execute(&mut *tx).await?;
+        }
+
+        let mut query = sqlx::query(sql);
+        for param in params {
+            query = bind_json_param(query, param);
+        }
+
+        let rows = query.fetch_all(&mut *tx).await?;
+        let result: Result<Vec<JsonRow>> = rows.iter().map(row_to_json).collect();
+
+        tx.commit().await?;
+
+        result
     }
 }
 
@@ -215,4 +305,64 @@ fn row_to_json(row: &PgRow) -> Result<serde_json::Value> {
     }
 
     Ok(serde_json::Value::Object(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rls_context_default_is_empty() {
+        let ctx = RlsContext::default();
+        assert!(ctx.role.is_none());
+        assert!(ctx.claims_json.is_none());
+        assert_eq!(ctx.claims_setting, "request.jwt.claims");
+    }
+
+    #[test]
+    fn rls_context_with_role() {
+        let ctx = RlsContext {
+            role: Some("authenticated".into()),
+            claims_json: Some(r#"{"sub":"user-1"}"#.into()),
+            claims_setting: "request.jwt.claims".into(),
+        };
+        assert_eq!(ctx.role.as_deref(), Some("authenticated"));
+    }
+
+    #[test]
+    fn rls_context_generates_set_statements() {
+        let ctx = RlsContext {
+            role: Some("authenticated".into()),
+            claims_json: Some(r#"{"sub":"user-1"}"#.into()),
+            claims_setting: "request.jwt.claims".into(),
+        };
+        let stmts = ctx.set_local_statements();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("SET LOCAL ROLE"));
+        assert!(stmts[1].contains("SET LOCAL"));
+        assert!(stmts[1].contains("request.jwt.claims"));
+    }
+
+    #[test]
+    fn rls_context_empty_generates_no_statements() {
+        let ctx = RlsContext::default();
+        let stmts = ctx.set_local_statements();
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn rls_context_escapes_single_quotes() {
+        let ctx = RlsContext {
+            role: Some("it's a role".into()),
+            claims_json: None,
+            claims_setting: "request.jwt.claims".into(),
+        };
+        let stmts = ctx.set_local_statements();
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].contains("it''s a role"),
+            "should escape quotes: {}",
+            stmts[0]
+        );
+    }
 }
