@@ -27,9 +27,30 @@ fn apply_on_plan_hooks(
     plan: &mut PlanNode,
 ) {
     if let Ok(store) = ctx.data::<PluginStore>() {
-        for plugin in store.0.iter() {
-            plugin.on_plan(plan);
+        apply_hooks_recursive(plan, &store.0);
+    }
+}
+
+/// Recursively apply plugin hooks to a plan tree
+fn apply_hooks_recursive(plan: &mut PlanNode, plugins: &[Arc<dyn Plugin>]) {
+    for plugin in plugins {
+        plugin.on_plan(plan);
+    }
+
+    // Recurse into child selections
+    match plan {
+        PlanNode::Scan { selections, .. }
+        | PlanNode::LateralJoin { selections, .. }
+        | PlanNode::BatchLookup { selections, .. }
+        | PlanNode::Mutation {
+            returning: selections,
+            ..
+        } => {
+            for child in selections.iter_mut() {
+                apply_hooks_recursive(child, plugins);
+            }
         }
+        PlanNode::Column { .. } => {}
     }
 }
 

@@ -1190,18 +1190,24 @@ impl Plugin for PublishedOnlyPlugin {
         "published-only"
     }
     fn on_plan(&self, plan: &mut PlanNode) {
-        if let PlanNode::Scan { filter, table, .. } = plan
-            && table == "posts"
-        {
-            let published_filter = FilterExpr::Eq {
-                column: "published".into(),
-                value: serde_json::json!(true),
-            };
-            *filter = Some(match filter.take() {
-                Some(existing) => FilterExpr::And(vec![existing, published_filter]),
-                None => published_filter,
-            });
-        }
+        let filter_slot = match plan {
+            PlanNode::Scan { filter, table, .. } if table == "posts" => filter,
+            PlanNode::LateralJoin {
+                filter,
+                child_table,
+                ..
+            } if child_table == "posts" => filter,
+            _ => return,
+        };
+
+        let published_filter = FilterExpr::Eq {
+            column: "published".into(),
+            value: serde_json::json!(true),
+        };
+        *filter_slot = Some(match filter_slot.take() {
+            Some(existing) => FilterExpr::And(vec![existing, published_filter]),
+            None => published_filter,
+        });
     }
 }
 
@@ -1494,6 +1500,71 @@ async fn has_many_lateral_respects_pagination() {
         .as_array()
         .expect("array");
     assert_eq!(alice_posts.len(), 2, "should respect first:2 pagination");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
+
+#[tokio::test]
+async fn on_plan_hooks_apply_to_lateral_joins() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    let options = SchemaOptions::default();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PublishedOnlyPlugin)];
+
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &options, &plugins).expect("schema build");
+
+    // Query users with posts — plugin should filter to published only
+    let result = gql_schema
+        .execute(
+            r"{ users(first: 10, orderBy: [NAME_ASC]) { edges { node { name postsByAuthorId(first: 10) { edges { node { title } } } } } } }",
+        )
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    let edges = data["users"]["edges"].as_array().expect("array");
+
+    // Alice has 1 published post ("First Post")
+    let alice = edges
+        .iter()
+        .find(|e| e["node"]["name"] == "Alice")
+        .expect("Alice");
+    let alice_posts = alice["node"]["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(alice_posts.len(), 1);
+    assert_eq!(alice_posts[0]["node"]["title"], "First Post");
+
+    // Bob has 0 published posts (his post is unpublished)
+    let bob = edges
+        .iter()
+        .find(|e| e["node"]["name"] == "Bob")
+        .expect("Bob");
+    let bob_posts = bob["node"]["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert!(
+        bob_posts.is_empty(),
+        "Bob's unpublished post should be filtered out"
+    );
 
     teardown_test_schema(&db, &schema_name).await;
 }
