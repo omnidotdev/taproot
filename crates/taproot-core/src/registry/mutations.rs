@@ -12,10 +12,33 @@ use crate::introspect::{ColumnInfo, TableInfo};
 use super::builder::{to_camel_case, to_pascal_case};
 use super::scalars::map_udt_to_graphql;
 
+/// Build a `{Type}OnConflict` input type for upsert support.
+///
+/// Contains `constraint` (the Postgres constraint name) and `updateColumns`
+/// (which columns to SET on conflict).
+#[must_use]
+pub fn build_on_conflict_input(type_name: &str) -> InputObject {
+    let input_name = format!("{type_name}OnConflict");
+    let mut input = InputObject::new(&input_name);
+
+    input = input.field(InputValue::new(
+        "constraint",
+        TypeRef::named_nn(TypeRef::STRING),
+    ));
+
+    input = input.field(InputValue::new(
+        "updateColumns",
+        TypeRef::named_nn_list_nn(TypeRef::STRING),
+    ));
+
+    input
+}
+
 /// Build a `Create{Type}Input` with all non-generated columns.
 ///
 /// Required fields are non-nullable columns without defaults. All other
-/// non-generated columns are optional.
+/// non-generated columns are optional. Includes an optional `onConflict`
+/// field for upsert support.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn build_create_input(
@@ -24,6 +47,7 @@ pub fn build_create_input(
     enum_names: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Create{type_name}Input");
+    let on_conflict_type = format!("{type_name}OnConflict");
     let mut input = InputObject::new(&input_name);
 
     input = input.field(InputValue::new(
@@ -40,6 +64,11 @@ pub fn build_create_input(
         let type_ref = create_input_type_ref(col, enum_names);
         input = input.field(InputValue::new(field_name, type_ref));
     }
+
+    input = input.field(InputValue::new(
+        "onConflict",
+        TypeRef::named(&on_conflict_type),
+    ));
 
     input
 }
@@ -158,6 +187,9 @@ fn create_input_type_ref(col: &ColumnInfo, enum_names: &HashSet<String>) -> Type
 
 /// Generate an `INSERT` statement with `RETURNING row_to_json(...)`.
 ///
+/// When `onConflict` is present in the input, generates an upsert using
+/// `ON CONFLICT ON CONSTRAINT ... DO UPDATE SET ...`.
+///
 /// Returns the SQL string and parameter values.
 ///
 /// # Panics
@@ -174,6 +206,9 @@ pub fn create_to_sql(
     let mut params = Vec::new();
     let mut idx = 1usize;
 
+    // Collect valid column names for validation
+    let valid_columns: HashSet<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+
     for col in &table.columns {
         if col.is_generated {
             continue;
@@ -181,8 +216,8 @@ pub fn create_to_sql(
 
         let field_name = to_camel_case(&col.name);
 
-        // Skip clientMutationId
-        if field_name == "clientMutationId" {
+        // Skip meta fields
+        if field_name == "clientMutationId" || field_name == "onConflict" {
             continue;
         }
 
@@ -205,16 +240,55 @@ pub fn create_to_sql(
         }
     }
 
+    let on_conflict_clause = obj
+        .get("onConflict")
+        .and_then(serde_json::Value::as_object)
+        .map(|oc| {
+            let constraint = oc
+                .get("constraint")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+
+            let update_columns: Vec<&str> = oc
+                .get("updateColumns")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|col| valid_columns.contains(col))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let set_clauses: Vec<String> = update_columns
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{ident} = EXCLUDED.{ident}",
+                        ident = quote_ident(col),
+                    )
+                })
+                .collect();
+
+            format!(
+                " ON CONFLICT ON CONSTRAINT {constraint} DO UPDATE SET {sets}",
+                constraint = quote_ident(constraint),
+                sets = set_clauses.join(", "),
+            )
+        })
+        .unwrap_or_default();
+
     let sql = format!(
         "WITH inserted AS (\
             INSERT INTO {schema}.{table} ({columns}) \
-            VALUES ({placeholders}) \
+            VALUES ({placeholders}){on_conflict} \
             RETURNING *\
         ) SELECT row_to_json(inserted.*) FROM inserted",
         schema = quote_ident(schema),
         table = quote_ident(&table.name),
         columns = columns.join(", "),
         placeholders = placeholders.join(", "),
+        on_conflict = on_conflict_clause,
     );
 
     (sql, params)
@@ -531,6 +605,60 @@ mod tests {
         assert!(sql.contains("\"user_id\" = $1"));
         assert!(sql.contains("AND"));
         assert!(sql.contains("\"role_id\" = $2"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn create_sql_with_on_conflict() {
+        let table = test_table();
+        let input = serde_json::json!({
+            "name": "Alice",
+            "email": "alice@example.com",
+            "onConflict": {
+                "constraint": "users_email_key",
+                "updateColumns": ["name"]
+            }
+        });
+
+        let (sql, params) = create_to_sql(&input, &table, "public");
+
+        assert!(sql.contains("ON CONFLICT ON CONSTRAINT \"users_email_key\""));
+        assert!(sql.contains("DO UPDATE SET \"name\" = EXCLUDED.\"name\""));
+        assert!(sql.contains("INSERT INTO"));
+        assert!(sql.contains("RETURNING"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn create_sql_on_conflict_filters_invalid_columns() {
+        let table = test_table();
+        let input = serde_json::json!({
+            "name": "Alice",
+            "email": "alice@example.com",
+            "onConflict": {
+                "constraint": "users_email_key",
+                "updateColumns": ["name", "nonexistent_col"]
+            }
+        });
+
+        let (sql, _params) = create_to_sql(&input, &table, "public");
+
+        assert!(sql.contains("DO UPDATE SET \"name\" = EXCLUDED.\"name\""));
+        assert!(!sql.contains("nonexistent_col"));
+    }
+
+    #[test]
+    fn create_sql_without_on_conflict_unchanged() {
+        let table = test_table();
+        let input = serde_json::json!({
+            "name": "Alice",
+            "email": "alice@example.com"
+        });
+
+        let (sql, params) = create_to_sql(&input, &table, "public");
+
+        assert!(!sql.contains("ON CONFLICT"));
+        assert!(sql.contains("INSERT INTO"));
         assert_eq!(params.len(), 2);
     }
 

@@ -2292,7 +2292,7 @@ async fn aggregates_on_connection() {
 
     let gql_schema = build_test_schema(&db, &schema_name).await;
 
-    let query = r#"{
+    let query = r"{
         orders(first: 10) {
             aggregates {
                 count
@@ -2303,7 +2303,7 @@ async fn aggregates_on_connection() {
             }
             edges { node { amount quantity } }
         }
-    }"#;
+    }";
 
     let result = gql_schema.execute(query).await;
 
@@ -2342,4 +2342,74 @@ async fn aggregates_on_connection() {
     let max_amount: f64 = agg["max"]["amount"].as_f64().expect("max.amount");
     assert!((max_amount - 30.5).abs() < 0.01, "max.amount = {max_amount}");
     assert_eq!(agg["max"]["label"], "gamma");
+}
+
+#[tokio::test]
+async fn upsert_with_on_conflict() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    // Query the actual constraint name from pg_constraint
+    let constraint_rows = db
+        .query_raw(&format!(
+            "SELECT con.conname FROM pg_constraint con \
+             JOIN pg_class rel ON rel.oid = con.conrelid \
+             JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace \
+             WHERE nsp.nspname = '{schema_name}' \
+             AND rel.relname = 'users' \
+             AND con.contype = 'u'"
+        ))
+        .await
+        .expect("failed to query constraint name");
+
+    let constraint_name = constraint_rows[0]["conname"]
+        .as_str()
+        .expect("constraint name must be a string");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Upsert: alice@example.com already exists from seed data, so this
+    // should update the name instead of inserting a duplicate
+    let mutation = format!(
+        r#"
+        mutation {{
+            createUser(input: {{
+                name: "Updated Alice",
+                email: "alice@example.com",
+                role: admin,
+                onConflict: {{
+                    constraint: "{constraint_name}",
+                    updateColumns: ["name"]
+                }}
+            }}) {{
+                user {{
+                    name
+                    email
+                    role
+                }}
+            }}
+        }}
+    "#
+    );
+
+    let result = gql_schema.execute(&mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "upsert mutation errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize result");
+    let payload = &data["createUser"];
+    assert_eq!(payload["user"]["name"], "Updated Alice");
+    assert_eq!(payload["user"]["email"], "alice@example.com");
+    // Role should remain admin since only name was in updateColumns
+    assert_eq!(payload["user"]["role"], "admin");
 }

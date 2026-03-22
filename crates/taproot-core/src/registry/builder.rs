@@ -1466,6 +1466,8 @@ fn register_mutation_types(
 
     if !omit_create {
         schema_builder =
+            schema_builder.register(mutations::build_on_conflict_input(type_name));
+        schema_builder =
             schema_builder.register(mutations::build_create_input(table, type_name, enum_names));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Create{type_name}"),
