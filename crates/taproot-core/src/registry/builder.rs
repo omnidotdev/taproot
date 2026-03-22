@@ -1996,14 +1996,20 @@ pub fn pluralize(s: &str) -> String {
 /// Returns the updated schema builder and the list of nested field descriptors
 /// to attach to the `CreateInput`.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+#[allow(clippy::too_many_lines)]
 fn build_nested_rel_inputs(
     mut schema_builder: async_graphql::dynamic::SchemaBuilder,
     table: &TableInfo,
     type_name: &str,
     enum_names: &HashSet<String>,
     all_tables: &[&TableInfo],
-) -> (async_graphql::dynamic::SchemaBuilder, Vec<mutations::NestedRelField>) {
+) -> (
+    async_graphql::dynamic::SchemaBuilder,
+    Vec<mutations::NestedRelField>,
+    Vec<mutations::NestedRelInfo>,
+) {
     let mut nested_fields: Vec<mutations::NestedRelField> = Vec::new();
+    let mut nested_rels: Vec<mutations::NestedRelInfo> = Vec::new();
 
     // Belongs-to: FKs on this table pointing to other tables
     for fk in &table.foreign_keys {
@@ -2051,6 +2057,9 @@ fn build_nested_rel_inputs(
             continue;
         }
 
+        let related_pk_column_names: Vec<String> =
+            related_pk_cols.iter().map(|c| c.name.clone()).collect();
+
         schema_builder = schema_builder.register(
             mutations::build_nested_connect_input(&connect_name, &related_pk_cols, enum_names),
         );
@@ -2063,12 +2072,28 @@ fn build_nested_rel_inputs(
         );
 
         nested_fields.push(mutations::NestedRelField {
-            field_name: rel_field_name,
+            field_name: rel_field_name.clone(),
             input_type_name: container_name,
+        });
+
+        nested_rels.push(mutations::NestedRelInfo {
+            field_name: rel_field_name,
+            direction: mutations::NestedRelDirection::BelongsTo {
+                fk_columns: fk.columns.clone(),
+                related_pk_columns: related_pk_column_names,
+            },
+            related_table: (*related_table).clone(),
+            related_schema: fk.foreign_schema.clone(),
         });
     }
 
     // Has-many: FKs on other tables pointing back to this table
+    let parent_pk_columns: Vec<String> = table
+        .primary_key
+        .as_ref()
+        .map(|pk| pk.columns.clone())
+        .unwrap_or_default();
+
     for other_table in all_tables {
         for fk in &other_table.foreign_keys {
             if fk.columns.len() != 1 || fk.foreign_columns.len() != 1 {
@@ -2099,13 +2124,23 @@ fn build_nested_rel_inputs(
             );
 
             nested_fields.push(mutations::NestedRelField {
-                field_name: rel_field_name,
+                field_name: rel_field_name.clone(),
                 input_type_name: container_name,
+            });
+
+            nested_rels.push(mutations::NestedRelInfo {
+                field_name: rel_field_name,
+                direction: mutations::NestedRelDirection::HasMany {
+                    child_fk_columns: fk.columns.clone(),
+                    parent_pk_columns: parent_pk_columns.clone(),
+                },
+                related_table: (*other_table).clone(),
+                related_schema: other_table.schema.clone(),
             });
         }
     }
 
-    (schema_builder, nested_fields)
+    (schema_builder, nested_fields, nested_rels)
 }
 
 /// Register all mutation input types, payload types, and mutation fields
@@ -2136,7 +2171,7 @@ fn register_mutation_types(
     let plural_field_name = pluralize(table_field_name);
 
     if !omit_create {
-        let (sb, nested_fields) =
+        let (sb, nested_fields, nested_rels) =
             build_nested_rel_inputs(schema_builder, table, type_name, enum_names, all_tables);
         schema_builder = sb;
 
@@ -2149,7 +2184,7 @@ fn register_mutation_types(
             table_field_name,
             type_name,
         ));
-        mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db));
+        mutation = mutation.field(build_create_mutation(table, type_name, table_field_name, db, &nested_rels));
 
         // Bulk create
         schema_builder = schema_builder
@@ -2610,6 +2645,7 @@ fn build_create_mutation(
     type_name: &str,
     table_field_name: &str,
     db: &Arc<dyn Database>,
+    nested_rels: &[mutations::NestedRelInfo],
 ) -> Field {
     let field_name = format!("create{type_name}");
     let input_type_name = format!("Create{type_name}Input");
@@ -2619,6 +2655,7 @@ fn build_create_mutation(
     let table_info = table.clone();
     let table_field = table_field_name.to_string();
     let db = Arc::clone(db);
+    let nested_rels = nested_rels.to_vec();
 
     Field::new(
         &field_name,
@@ -2628,31 +2665,214 @@ fn build_create_mutation(
             let schema_name = schema_name.clone();
             let table_info = table_info.clone();
             let table_field = table_field.clone();
+            let nested_rels = nested_rels.clone();
 
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
                 let input_value = ctx.args.try_get("input")?;
-                let input_json = gql_value_to_json(input_value.as_value());
+                let mut input_json = gql_value_to_json(input_value.as_value());
 
                 let client_mutation_id = input_json
                     .get("clientMutationId")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let (sql, params) =
-                    mutations::create_to_sql(&input_json, &table_info, &schema_name);
+                // Check if any nested relationship fields are present
+                let has_nested = nested_rels.iter().any(|rel| {
+                    input_json.get(&rel.field_name).is_some_and(|v| !v.is_null())
+                });
 
-                let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
-                    async_graphql::Error::new(format!("database error: {e}"))
-                })?;
+                let row = if has_nested {
+                    // Use a transaction for nested operations
+                    let mut tx = db.begin().await.map_err(|e| {
+                        async_graphql::Error::new(format!("transaction error: {e}"))
+                    })?;
 
-                let row = rows
-                    .into_iter()
-                    .next()
-                    .and_then(|r| {
-                        r.get("row_to_json").cloned().or(Some(r))
-                    })
-                    .unwrap_or(serde_json::Value::Null);
+                    if let Some(rls) = rls {
+                        tx.set_rls(rls).await.map_err(|e| {
+                            async_graphql::Error::new(format!("RLS error: {e}"))
+                        })?;
+                    }
+
+                    let input_obj = input_json.as_object_mut().ok_or_else(|| {
+                        async_graphql::Error::new("input must be an object")
+                    })?;
+
+                    // Phase 1 & 2: Process belongs-to relationships
+                    for rel in &nested_rels {
+                        let nested_val = input_obj.remove(&rel.field_name);
+                        let Some(nested_val) = nested_val else {
+                            continue;
+                        };
+                        if nested_val.is_null() {
+                            continue;
+                        }
+
+                        match &rel.direction {
+                            mutations::NestedRelDirection::BelongsTo {
+                                fk_columns,
+                                related_pk_columns,
+                            } => {
+                                let nested_obj = nested_val.as_object().ok_or_else(|| {
+                                    async_graphql::Error::new(format!(
+                                        "nested field `{}` must be an object",
+                                        rel.field_name
+                                    ))
+                                })?;
+
+                                if let Some(connect_val) = nested_obj.get("connect") {
+                                    // Phase 1: Connect — extract PK from connect input, set FK
+                                    let connect_obj = connect_val.as_object().ok_or_else(|| {
+                                        async_graphql::Error::new("connect must be an object")
+                                    })?;
+
+                                    for (fk_col, pk_col) in fk_columns.iter().zip(related_pk_columns.iter()) {
+                                        let pk_field = to_camel_case(pk_col);
+                                        let pk_value = connect_obj.get(&pk_field).cloned().ok_or_else(|| {
+                                            async_graphql::Error::new(format!(
+                                                "connect input missing required field `{pk_field}`"
+                                            ))
+                                        })?;
+                                        let fk_field = to_camel_case(fk_col);
+                                        input_obj.insert(fk_field, pk_value);
+                                    }
+                                } else if let Some(create_val) = nested_obj.get("create") {
+                                    // Phase 2: Create — INSERT related record, extract PK
+                                    let (sql, params) = mutations::create_to_sql(
+                                        create_val,
+                                        &rel.related_table,
+                                        &rel.related_schema,
+                                    );
+
+                                    let rows = tx.query(&sql, &params).await.map_err(|e| {
+                                        async_graphql::Error::new(format!("database error: {e}"))
+                                    })?;
+
+                                    let related_row = rows
+                                        .into_iter()
+                                        .next()
+                                        .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                                        .ok_or_else(|| {
+                                            async_graphql::Error::new(
+                                                "nested create returned no row"
+                                            )
+                                        })?;
+
+                                    for (fk_col, pk_col) in fk_columns.iter().zip(related_pk_columns.iter()) {
+                                        let pk_value = related_row.get(pk_col).cloned().ok_or_else(|| {
+                                            async_graphql::Error::new(format!(
+                                                "nested create result missing PK column `{pk_col}`"
+                                            ))
+                                        })?;
+                                        let fk_field = to_camel_case(fk_col);
+                                        input_obj.insert(fk_field, pk_value);
+                                    }
+                                }
+                            }
+                            mutations::NestedRelDirection::HasMany { .. } => {
+                                // Re-insert; has-many is processed after main insert
+                                input_obj.insert(rel.field_name.clone(), nested_val);
+                            }
+                        }
+                    }
+
+                    // Phase 3: INSERT the main record
+                    let main_input = serde_json::Value::Object(input_obj.clone());
+                    let (sql, params) =
+                        mutations::create_to_sql(&main_input, &table_info, &schema_name);
+
+                    let rows = tx.query(&sql, &params).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    let main_row = rows
+                        .into_iter()
+                        .next()
+                        .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                        .ok_or_else(|| {
+                            async_graphql::Error::new("create returned no row")
+                        })?;
+
+                    // Phase 4: Process has-many relationships
+                    for rel in &nested_rels {
+                        let nested_val = input_obj.get(&rel.field_name);
+                        let Some(nested_val) = nested_val else {
+                            continue;
+                        };
+                        if nested_val.is_null() {
+                            continue;
+                        }
+
+                        if let mutations::NestedRelDirection::HasMany {
+                            child_fk_columns,
+                            parent_pk_columns,
+                        } = &rel.direction
+                        {
+                            let nested_obj = nested_val.as_object().ok_or_else(|| {
+                                async_graphql::Error::new(format!(
+                                    "nested field `{}` must be an object",
+                                    rel.field_name
+                                ))
+                            })?;
+
+                            if let Some(create_arr) = nested_obj.get("create") {
+                                let items = create_arr.as_array().ok_or_else(|| {
+                                    async_graphql::Error::new("has-many create must be an array")
+                                })?;
+
+                                for item in items {
+                                    let mut child_input = item.clone();
+                                    let child_obj = child_input.as_object_mut().ok_or_else(|| {
+                                        async_graphql::Error::new(
+                                            "has-many create item must be an object"
+                                        )
+                                    })?;
+
+                                    // Set FK columns to parent's PK values
+                                    for (child_fk, parent_pk) in child_fk_columns.iter().zip(parent_pk_columns.iter()) {
+                                        let pk_value = main_row.get(parent_pk).cloned().ok_or_else(|| {
+                                            async_graphql::Error::new(format!(
+                                                "parent row missing PK column `{parent_pk}`"
+                                            ))
+                                        })?;
+                                        let fk_field = to_camel_case(child_fk);
+                                        child_obj.insert(fk_field, pk_value);
+                                    }
+
+                                    let (sql, params) = mutations::create_to_sql(
+                                        &serde_json::Value::Object(child_obj.clone()),
+                                        &rel.related_table,
+                                        &rel.related_schema,
+                                    );
+
+                                    tx.query(&sql, &params).await.map_err(|e| {
+                                        async_graphql::Error::new(format!("database error: {e}"))
+                                    })?;
+                                }
+                            }
+                        }
+                    }
+
+                    // Commit transaction
+                    tx.commit().await.map_err(|e| {
+                        async_graphql::Error::new(format!("commit error: {e}"))
+                    })?;
+
+                    main_row
+                } else {
+                    // No nested fields — use existing non-transactional path
+                    let (sql, params) =
+                        mutations::create_to_sql(&input_json, &table_info, &schema_name);
+
+                    let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    rows.into_iter()
+                        .next()
+                        .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                        .unwrap_or(serde_json::Value::Null)
+                };
 
                 let mut payload = serde_json::Map::new();
                 payload.insert("clientMutationId".to_string(), client_mutation_id);

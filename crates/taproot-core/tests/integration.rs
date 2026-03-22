@@ -3127,3 +3127,153 @@ async fn nested_connect_input_type_has_pk_fields() {
         "id field inner type should be UUID"
     );
 }
+
+#[tokio::test]
+async fn nested_create_with_belongs_to_connect() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Use Alice's known UUID to connect
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Nested Connect Test"
+                content: "Testing"
+                userByAuthorId: { connect: { id: "00000000-0000-0000-0000-000000000001" } }
+            }) {
+                post {
+                    title
+                    userByAuthorId { name }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "nested connect errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let post = &data["createPost"]["post"];
+    assert_eq!(post["title"], "Nested Connect Test");
+    assert_eq!(post["userByAuthorId"]["name"], "Alice");
+}
+
+#[tokio::test]
+async fn nested_create_with_belongs_to_create() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Nested Create Test"
+                content: "Testing"
+                userByAuthorId: {
+                    create: {
+                        name: "InlineUser"
+                        email: "inline@test.com"
+                    }
+                }
+            }) {
+                post {
+                    title
+                    userByAuthorId { name email }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "nested create errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let post = &data["createPost"]["post"];
+    assert_eq!(post["title"], "Nested Create Test");
+    assert_eq!(post["userByAuthorId"]["name"], "InlineUser");
+    assert_eq!(post["userByAuthorId"]["email"], "inline@test.com");
+}
+
+#[tokio::test]
+async fn nested_create_with_has_many_create() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    let mutation = r#"
+        mutation {
+            createPost(input: {
+                title: "Post With Comments"
+                content: "Testing"
+                authorId: "00000000-0000-0000-0000-000000000001"
+                commentsByPostId: {
+                    create: [
+                        { body: "Comment 1", authorId: "00000000-0000-0000-0000-000000000001" }
+                        { body: "Comment 2", authorId: "00000000-0000-0000-0000-000000000001" }
+                    ]
+                }
+            }) {
+                post {
+                    title
+                    commentsByPostId { edges { node { body } } }
+                }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "nested has-many create errors: {:?}",
+        result.errors
+    );
+
+    let data = result.data.into_json().expect("failed to serialize");
+    let post = &data["createPost"]["post"];
+    assert_eq!(post["title"], "Post With Comments");
+
+    let edges = post["commentsByPostId"]["edges"]
+        .as_array()
+        .expect("edges should be an array");
+    assert_eq!(edges.len(), 2, "should have 2 comments");
+
+    let bodies: Vec<&str> = edges
+        .iter()
+        .map(|e| e["node"]["body"].as_str().unwrap())
+        .collect();
+    assert!(bodies.contains(&"Comment 1"));
+    assert!(bodies.contains(&"Comment 2"));
+}

@@ -21,6 +21,39 @@ pub struct NestedRelField {
     pub input_type_name: String,
 }
 
+/// Runtime metadata for resolving a nested relationship during a create
+/// mutation.
+#[derive(Clone, Debug)]
+pub struct NestedRelInfo {
+    /// camelCase field name on the input (e.g. `userByAuthorId`)
+    pub field_name: String,
+    /// Direction of the relationship
+    pub direction: NestedRelDirection,
+    /// Related table info for SQL generation
+    pub related_table: TableInfo,
+    /// Related table's schema name
+    pub related_schema: String,
+}
+
+/// Direction of a nested relationship.
+#[derive(Clone, Debug)]
+pub enum NestedRelDirection {
+    /// FK column(s) are on this table, pointing to related table's PK
+    BelongsTo {
+        /// Local FK column names (e.g. `["author_id"]`)
+        fk_columns: Vec<String>,
+        /// Related table PK column names (e.g. `["id"]`)
+        related_pk_columns: Vec<String>,
+    },
+    /// FK column(s) are on the child table, pointing to this table's PK
+    HasMany {
+        /// Child table's FK column names pointing to this table
+        child_fk_columns: Vec<String>,
+        /// This table's PK column names
+        parent_pk_columns: Vec<String>,
+    },
+}
+
 /// Build a nested belongs-to input type with `create` and `connect` fields.
 ///
 /// For example, `PostUserByAuthorIdInput` has:
