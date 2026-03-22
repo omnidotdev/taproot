@@ -23,6 +23,8 @@ pub struct AppState {
     pub auth: AuthConfig,
     /// GraphQL endpoint path.
     pub graphql_path: String,
+    /// Whether the `GraphiQL` playground is enabled.
+    pub playground: bool,
 }
 
 /// Build the axum router with `GraphQL` and health check routes.
@@ -34,6 +36,7 @@ pub fn build_router(schema: Schema, config: &ServerConfig, auth: &AuthConfig) ->
         schema: Arc::new(schema.clone()),
         auth: auth.clone(),
         graphql_path: gql_path.clone(),
+        playground: config.playground,
     };
 
     Router::new()
@@ -60,15 +63,17 @@ async fn graphql_post(
 async fn graphql_get_or_playground(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<GraphQlGetParams>,
+    params: Result<axum::extract::Query<GraphQlGetParams>, axum::extract::rejection::QueryRejection>,
 ) -> axum::response::Response {
+    let query = params.map(|q| q.0.query).unwrap_or_default();
+
     // Serve GraphiQL if the request accepts HTML and has no query
     let accepts_html = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("text/html"));
 
-    if accepts_html && params.query.is_empty() {
+    if state.playground && accepts_html && query.is_empty() {
         return Html(
             GraphiQLSource::build()
                 .endpoint(&state.graphql_path)
@@ -77,13 +82,13 @@ async fn graphql_get_or_playground(
         .into_response();
     }
 
-    if params.query.is_empty() {
+    if query.is_empty() {
         return Json(serde_json::json!({"errors": [{"message": "Missing query parameter"}]}))
             .into_response();
     }
 
     let rls = build_rls_context(&state.auth, &headers);
-    let request = async_graphql::Request::new(&params.query).data(rls);
+    let request = async_graphql::Request::new(&query).data(rls);
     let response = state.schema.execute(request).await;
     Json(response).into_response()
 }

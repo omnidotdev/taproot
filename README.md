@@ -1,0 +1,86 @@
+# Taproot
+
+Auto-generate a GraphQL API from a PostgreSQL database. Point Taproot at your database, and it introspects your schema to produce a fully-featured GraphQL endpoint — queries with filtering, sorting, and Relay-style pagination; create/update/delete mutations; and real-time subscriptions via Postgres NOTIFY.
+
+## Quick start
+
+```bash
+cargo install --path crates/taproot-server
+```
+
+Create a `taproot.yaml`:
+
+```yaml
+database:
+  url: "postgres://user:pass@localhost:5432/mydb"
+server:
+  listen: "0.0.0.0:4000"
+  playground: true
+```
+
+Run the server:
+
+```bash
+taproot -c taproot.yaml
+```
+
+Open `http://localhost:4000/graphql` in a browser to explore your API with GraphiQL.
+
+## Features
+
+- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types
+- **Relay pagination** — cursor-based connections with `first`/`after`/`last`/`before`
+- **Filtering** — `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `like`, `ilike`, `startsWith`, `endsWith`, `isNull`, plus `and`/`or`/`not` combinators
+- **Mutations** — auto-generated `create`, `update`, `delete` operations for tables with single-column primary keys
+- **Subscriptions** — real-time change notifications via Postgres `LISTEN`/`NOTIFY`
+- **Row-Level Security** — JWT-based auth with RLS passthrough to Postgres
+- **Apollo Federation** — expose tables as federated subgraph entities
+- **Lattice integration** — embed as a subgraph executor in the Lattice gateway
+- **Plugin system** — `on_introspect`, `on_plan`, and `filter_table` hooks for schema and query customization
+- **Smart comments** — `@omit`, `@name`, `@deprecated` table/column annotations
+- **Query limits** — configurable depth and complexity limits to prevent abuse
+- **Embeddable** — use as a Rust library via `taproot-core`
+
+## Configuration
+
+See the [full configuration reference](https://docs.omni.dev/armory/taproot/configuration) or the example below:
+
+```yaml
+database:
+  url: "postgres://localhost:5432/mydb"
+  pool_size: 20
+  schemas: ["public"]
+  exclude_tables: ["migrations"]
+
+server:
+  listen: "0.0.0.0:4000"
+  graphql_path: "/graphql"
+  playground: true
+
+schema:
+  relay_pagination: true
+  default_page_size: 25
+  max_page_size: 100
+  federation: false
+  subscriptions: false
+  max_depth: 15
+  max_complexity: 1000
+
+auth:
+  rls: false
+  role_claim: "pg_role"
+  default_role: "anonymous"
+  jwt_secret: null
+
+subscriptions:
+  enabled: false
+  notify_channel: "graphql_subscriptions"
+```
+
+## Documentation
+
+Full documentation is available at [docs.omni.dev/armory/taproot](https://docs.omni.dev/armory/taproot).
+
+## License
+
+Apache-2.0

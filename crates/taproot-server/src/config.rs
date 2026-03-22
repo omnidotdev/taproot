@@ -80,7 +80,7 @@ pub struct ServerConfig {
     /// GraphQL endpoint path.
     #[serde(default = "default_graphql_path")]
     pub graphql_path: String,
-    /// Enable the `GraphiQL` playground at `GET /`.
+    /// Enable the `GraphiQL` playground on `GET /graphql`.
     #[serde(default = "default_playground")]
     pub playground: bool,
 }
