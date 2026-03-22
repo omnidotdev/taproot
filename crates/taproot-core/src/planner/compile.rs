@@ -105,6 +105,112 @@ fn compile_order_by(exprs: &[OrderByExpr]) -> String {
     parts.join(", ")
 }
 
+/// Compile a `Scan` node that contains `LateralJoin` children into a
+/// `SELECT row_to_json(sub.*)` query with `LEFT JOIN LATERAL` subqueries
+fn compile_scan_with_laterals(
+    schema: &str,
+    table: &str,
+    filter: Option<&FilterExpr>,
+    order_by: Option<&Vec<OrderByExpr>>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    laterals: &[&PlanNode],
+) -> (String, Vec<Value>) {
+    let mut all_params: Vec<Value> = Vec::new();
+    let mut param_offset: usize = 1;
+
+    // Build SELECT columns: t.* plus lateral aliases
+    let mut select_cols = String::from("t.*");
+    for (i, lateral) in laterals.iter().enumerate() {
+        if let PlanNode::LateralJoin { child_table, .. } = lateral {
+            let _ = write!(select_cols, ", lj{i}.rows AS \"__lateral_{child_table}\"");
+        }
+    }
+
+    // Build lateral join clauses
+    let mut lateral_clauses = String::new();
+    for (i, lateral) in laterals.iter().enumerate() {
+        if let PlanNode::LateralJoin {
+            parent_key,
+            child_schema,
+            child_table,
+            child_key,
+            filter: child_filter,
+            order_by: child_order_by,
+            limit: child_limit,
+            offset: child_offset,
+            ..
+        } = lateral
+        {
+            let _ = write!(
+                lateral_clauses,
+                " LEFT JOIN LATERAL (SELECT COALESCE(json_agg(row_to_json(c.*)), '[]'::json) AS rows FROM {}.{} c WHERE c.{} = t.{}",
+                quote_ident(child_schema),
+                quote_ident(child_table),
+                quote_ident(child_key),
+                quote_ident(parent_key),
+            );
+
+            if let Some(cf) = child_filter {
+                let (filter_sql, filter_params) = compile_filter(cf, param_offset);
+                param_offset += filter_params.len();
+                all_params.extend(filter_params);
+                let _ = write!(lateral_clauses, " AND {filter_sql}");
+            }
+
+            if let Some(order_exprs) = child_order_by
+                && !order_exprs.is_empty()
+            {
+                let _ = write!(
+                    lateral_clauses,
+                    " ORDER BY {}",
+                    compile_order_by(order_exprs)
+                );
+            }
+
+            if let Some(lim) = child_limit {
+                let _ = write!(lateral_clauses, " LIMIT {lim}");
+            }
+
+            if let Some(off) = child_offset {
+                let _ = write!(lateral_clauses, " OFFSET {off}");
+            }
+
+            let _ = write!(lateral_clauses, ") lj{i} ON true");
+        }
+    }
+
+    // Build inner query
+    let mut inner = format!(
+        "SELECT {select_cols} FROM {}.{} t{lateral_clauses}",
+        quote_ident(schema),
+        quote_ident(table),
+    );
+
+    if let Some(expr) = filter {
+        let (where_sql, where_params) = compile_filter(expr, param_offset);
+        all_params.extend(where_params);
+        let _ = write!(inner, " WHERE {where_sql}");
+    }
+
+    if let Some(order_exprs) = order_by
+        && !order_exprs.is_empty()
+    {
+        let _ = write!(inner, " ORDER BY {}", compile_order_by(order_exprs));
+    }
+
+    if let Some(lim) = limit {
+        let _ = write!(inner, " LIMIT {lim}");
+    }
+
+    if let Some(off) = offset {
+        let _ = write!(inner, " OFFSET {off}");
+    }
+
+    let sql = format!("SELECT row_to_json(sub.*) FROM ({inner}) sub");
+    (sql, all_params)
+}
+
 /// Compile a `PlanNode` into a parameterized SQL query
 #[must_use]
 pub fn compile_plan(plan: &PlanNode) -> (String, Vec<Value>) {
@@ -116,8 +222,26 @@ pub fn compile_plan(plan: &PlanNode) -> (String, Vec<Value>) {
             order_by,
             limit,
             offset,
-            ..
+            selections,
         } => {
+            // Collect lateral join children
+            let laterals: Vec<_> = selections
+                .iter()
+                .filter(|s| matches!(s, PlanNode::LateralJoin { .. }))
+                .collect();
+
+            if !laterals.is_empty() {
+                return compile_scan_with_laterals(
+                    schema,
+                    table,
+                    filter.as_ref(),
+                    order_by.as_ref(),
+                    *limit,
+                    *offset,
+                    &laterals,
+                );
+            }
+
             let mut sql = format!(
                 "SELECT row_to_json(t.*) FROM {}.{} t",
                 quote_ident(schema),
@@ -374,6 +498,201 @@ mod tests {
             "SELECT row_to_json(t.*) FROM \"public\".\"users\" t WHERE \"id\" IN ($1, $2, $3)"
         );
         assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn compile_lateral_join_simple() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::LateralJoin {
+                parent_key: "id".into(),
+                child_schema: "public".into(),
+                child_table: "posts".into(),
+                child_key: "author_id".into(),
+                filter: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                selections: vec![],
+            }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert!(sql.contains("LATERAL"), "SQL should contain LATERAL: {sql}");
+        assert!(sql.contains("json_agg"), "SQL should aggregate child rows: {sql}");
+        assert!(sql.contains("\"author_id\" = t.\"id\""), "SQL should join on FK=PK: {sql}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn compile_lateral_join_with_filter() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::LateralJoin {
+                parent_key: "id".into(),
+                child_schema: "public".into(),
+                child_table: "posts".into(),
+                child_key: "author_id".into(),
+                filter: Some(FilterExpr::Eq {
+                    column: "published".into(),
+                    value: serde_json::json!(true),
+                }),
+                order_by: None,
+                limit: None,
+                offset: None,
+                selections: vec![],
+            }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert!(sql.contains("\"published\" = $1"), "SQL should contain child filter: {sql}");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn compile_lateral_join_with_order_limit() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::LateralJoin {
+                parent_key: "id".into(),
+                child_schema: "public".into(),
+                child_table: "posts".into(),
+                child_key: "author_id".into(),
+                filter: None,
+                order_by: Some(vec![OrderByExpr {
+                    column: "created_at".into(),
+                    direction: OrderDirection::Desc,
+                }]),
+                limit: Some(10),
+                offset: Some(5),
+                selections: vec![],
+            }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert!(sql.contains("ORDER BY"), "SQL should contain ORDER BY: {sql}");
+        assert!(sql.contains("LIMIT 10"), "SQL should contain LIMIT: {sql}");
+        assert!(sql.contains("OFFSET 5"), "SQL should contain OFFSET: {sql}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn compile_lateral_join_with_parent_filter() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: Some(FilterExpr::Eq {
+                column: "active".into(),
+                value: serde_json::json!(true),
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::LateralJoin {
+                parent_key: "id".into(),
+                child_schema: "public".into(),
+                child_table: "posts".into(),
+                child_key: "author_id".into(),
+                filter: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                selections: vec![],
+            }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert!(sql.contains("\"active\" = $1"), "Parent filter should be present: {sql}");
+        assert!(sql.contains("LATERAL"), "Lateral join should still be present: {sql}");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn compile_lateral_join_multiple() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![
+                PlanNode::LateralJoin {
+                    parent_key: "id".into(),
+                    child_schema: "public".into(),
+                    child_table: "posts".into(),
+                    child_key: "author_id".into(),
+                    filter: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    selections: vec![],
+                },
+                PlanNode::LateralJoin {
+                    parent_key: "id".into(),
+                    child_schema: "public".into(),
+                    child_table: "comments".into(),
+                    child_key: "user_id".into(),
+                    filter: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    selections: vec![],
+                },
+            ],
+        };
+        let (sql, params) = compile_plan(&plan);
+        assert!(sql.contains("lj0"), "SQL should contain lj0 alias: {sql}");
+        assert!(sql.contains("lj1"), "SQL should contain lj1 alias: {sql}");
+        assert!(sql.contains("\"__lateral_posts\""), "SQL should contain __lateral_posts column: {sql}");
+        assert!(sql.contains("\"__lateral_comments\""), "SQL should contain __lateral_comments column: {sql}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn compile_lateral_join_child_and_parent_filter() {
+        let plan = PlanNode::Scan {
+            schema: "public".into(),
+            table: "users".into(),
+            filter: Some(FilterExpr::Eq {
+                column: "active".into(),
+                value: serde_json::json!(true),
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            selections: vec![PlanNode::LateralJoin {
+                parent_key: "id".into(),
+                child_schema: "public".into(),
+                child_table: "posts".into(),
+                child_key: "author_id".into(),
+                filter: Some(FilterExpr::Eq {
+                    column: "published".into(),
+                    value: serde_json::json!(true),
+                }),
+                order_by: None,
+                limit: None,
+                offset: None,
+                selections: vec![],
+            }],
+        };
+        let (sql, params) = compile_plan(&plan);
+        // Child filter is compiled first (inside the lateral subquery)
+        assert!(sql.contains("\"published\" = $1"), "Child filter should get $1: {sql}");
+        // Parent filter is compiled after lateral joins
+        assert!(sql.contains("\"active\" = $2"), "Parent filter should get $2: {sql}");
+        assert_eq!(params.len(), 2);
     }
 
     #[test]
