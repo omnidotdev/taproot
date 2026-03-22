@@ -13,7 +13,7 @@ use crate::plugin::Plugin;
 
 use super::federation;
 use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
-use super::scalars::{map_udt_to_graphql, needs_custom_scalar};
+use super::scalars::map_udt_to_graphql;
 use super::types::SchemaOptions;
 use super::{connection, filters, mutations, ordering};
 
@@ -90,7 +90,6 @@ pub fn build_schema(
     // Store plugins for resolver-time access (on_plan hooks)
     let plugin_store = PluginStore(Arc::new(plugins.to_vec()));
 
-    let mut custom_scalars: HashSet<&'static str> = HashSet::new();
     let mut query = Object::new("Query");
 
     // Collect all enum type names for lookup during column mapping
@@ -124,6 +123,11 @@ pub fn build_schema(
         }
     }
 
+    // Register all custom scalars upfront (condition types reference them)
+    for scalar_name in &["UUID", "DateTime", "Date", "JSON", "BigInt", "BigDecimal"] {
+        schema_builder = schema_builder.register(Scalar::new(*scalar_name));
+    }
+
     // Register scalar condition types (StringCondition, IntCondition, etc)
     for condition_input in filters::build_scalar_conditions() {
         schema_builder = schema_builder.register(condition_input);
@@ -136,14 +140,6 @@ pub fn build_schema(
     for introspected in &schemas {
         for table in &introspected.tables {
             let type_name = to_pascal_case(&table.name);
-
-            // Collect custom scalars needed by this table's columns
-            for col in &table.columns {
-                let (gql_type, _) = resolve_column_type(col, &enum_names);
-                if let Some(scalar) = needs_custom_scalar(&gql_type) {
-                    custom_scalars.insert(scalar);
-                }
-            }
 
             // Build the object type with column fields and relationship fields
             let object =
@@ -245,11 +241,6 @@ pub fn build_schema(
                 }
             }
         }
-    }
-
-    // Register collected custom scalars
-    for scalar_name in &custom_scalars {
-        schema_builder = schema_builder.register(Scalar::new(*scalar_name));
     }
 
     schema_builder = schema_builder.register(query);
@@ -846,7 +837,14 @@ fn build_unique_query(
 fn build_lateral_selections(
     parent_table: &TableInfo,
     all_tables: &[TableInfo],
+    visited: &mut HashSet<(String, String)>,
 ) -> Vec<PlanNode> {
+    // Mark this table as visited to prevent cycles
+    let key = (parent_table.schema.clone(), parent_table.name.clone());
+    if !visited.insert(key.clone()) {
+        return vec![];
+    }
+
     let mut selections = Vec::new();
 
     for child_table in all_tables {
@@ -860,7 +858,7 @@ fn build_lateral_selections(
             }
 
             // Recurse: find grandchild laterals for this child table
-            let child_selections = build_lateral_selections(child_table, all_tables);
+            let child_selections = build_lateral_selections(child_table, all_tables, visited);
 
             selections.push(PlanNode::LateralJoin {
                 parent_key: fk.foreign_columns[0].clone(),
@@ -875,6 +873,9 @@ fn build_lateral_selections(
             });
         }
     }
+
+    // Unmark so other paths can visit this table
+    visited.remove(&key);
 
     selections
 }
@@ -951,7 +952,8 @@ fn build_list_query(
                 let limit = first.unwrap_or(default_page_size).min(max_page_size);
 
                 // Build lateral joins for has-many relationships
-                let lateral_selections = build_lateral_selections(&table_info, &all_tables_for_lateral);
+                let mut visited = HashSet::new();
+                let lateral_selections = build_lateral_selections(&table_info, &all_tables_for_lateral, &mut visited);
 
                 // Build plan for data query
                 #[allow(clippy::cast_possible_wrap)]
