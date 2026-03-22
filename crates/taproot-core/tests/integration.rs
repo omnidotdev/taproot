@@ -1583,3 +1583,93 @@ async fn on_plan_hooks_apply_to_lateral_joins() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+#[tokio::test]
+async fn deep_nested_has_many_via_lateral_join() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Query 3 levels deep: users -> posts -> comments
+    let result = gql_schema
+        .execute(
+            r"{
+                users(first: 10, orderBy: [NAME_ASC]) {
+                    edges {
+                        node {
+                            name
+                            postsByAuthorId(first: 10) {
+                                edges {
+                                    node {
+                                        title
+                                        commentsByPostId(first: 10) {
+                                            edges {
+                                                node {
+                                                    body
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }",
+        )
+        .await;
+
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("should serialize");
+    let edges = data["users"]["edges"].as_array().expect("array");
+    assert_eq!(edges.len(), 2);
+
+    // Alice's "First Post" should have 2 comments
+    let alice = edges
+        .iter()
+        .find(|e| e["node"]["name"] == "Alice")
+        .expect("Alice");
+    let alice_posts = alice["node"]["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(alice_posts.len(), 1);
+    assert_eq!(alice_posts[0]["node"]["title"], "First Post");
+
+    let first_post_comments = alice_posts[0]["node"]["commentsByPostId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(
+        first_post_comments.len(),
+        2,
+        "First Post should have 2 comments"
+    );
+
+    // Bob's "Draft Post" should have 1 comment
+    let bob = edges
+        .iter()
+        .find(|e| e["node"]["name"] == "Bob")
+        .expect("Bob");
+    let bob_posts = bob["node"]["postsByAuthorId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(bob_posts.len(), 1);
+    assert_eq!(bob_posts[0]["node"]["title"], "Draft Post");
+
+    let draft_comments = bob_posts[0]["node"]["commentsByPostId"]["edges"]
+        .as_array()
+        .expect("array");
+    assert_eq!(
+        draft_comments.len(),
+        1,
+        "Draft Post should have 1 comment"
+    );
+    assert_eq!(draft_comments[0]["node"]["body"], "Nice draft");
+
+    teardown_test_schema(&db, &schema_name).await;
+}
