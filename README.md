@@ -43,7 +43,7 @@ Open `http://localhost:4000/graphql` in a browser to explore your API with Graph
 
 ## Configuration
 
-See the [full configuration reference](https://docs.omni.dev/armory/taproot/configuration) or the example below:
+See the [full configuration reference](https://docs.omni.dev/products/taproot/configuration) or the example below:
 
 ```yaml
 database:
@@ -79,7 +79,7 @@ subscriptions:
 
 ## Documentation
 
-Full documentation is available at [docs.omni.dev/armory/taproot](https://docs.omni.dev/armory/taproot).
+Full documentation is available at [docs.omni.dev/products/taproot](https://docs.omni.dev/products/taproot).
 
 ## License
 
