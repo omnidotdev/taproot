@@ -387,9 +387,7 @@ async fn fetch_functions(db: &dyn Database, schema: &str) -> Result<Vec<Function
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
         WHERE n.nspname = '{schema}'
-          AND p.prokind = 'f'
-          AND NOT p.proisagg
-          AND NOT p.proiswindow"
+          AND p.prokind = 'f'"
     );
 
     let rows = db.query_raw(&sql).await?;
