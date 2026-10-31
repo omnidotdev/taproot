@@ -3564,3 +3564,87 @@ async fn nested_mutation_respects_omit_create_on_related_table() {
 
     teardown_test_schema(&db, &schema_name).await;
 }
+
+/// Plugin that adds a custom `userCount` root query backed by SQL, exercising
+/// the makeExtendSchemaPlugin-parity hook.
+struct UserCountPlugin {
+    schema: String,
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+impl Plugin for UserCountPlugin {
+    fn name(&self) -> &str {
+        "user-count"
+    }
+
+    fn query_fields(
+        &self,
+        _schemas: &[taproot_core::introspect::IntrospectedSchema],
+    ) -> Vec<async_graphql::dynamic::Field> {
+        let schema = self.schema.clone();
+        vec![async_graphql::dynamic::Field::new(
+            "userCount",
+            async_graphql::dynamic::TypeRef::named(async_graphql::dynamic::TypeRef::INT),
+            move |ctx| {
+                let schema = schema.clone();
+                async_graphql::dynamic::FieldFuture::new(async move {
+                    let db = ctx.data::<Arc<dyn Database>>()?;
+                    let rls = ctx.data::<RlsContext>().ok();
+                    let sql = format!("SELECT COUNT(*) AS count FROM \"{schema}\".users");
+                    let rows = db
+                        .query_with_rls(&sql, &[], rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                    let count = rows
+                        .first()
+                        .and_then(|r| r.get("count"))
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    Ok(Some(async_graphql::dynamic::FieldValue::value(
+                        async_graphql::Value::from(count),
+                    )))
+                })
+            },
+        )]
+    }
+}
+
+#[tokio::test]
+async fn plugin_adds_custom_sql_backed_query_field() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let introspected = introspect(
+        &db,
+        &IntrospectOptions {
+            schemas: vec![schema_name.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("introspection");
+
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(UserCountPlugin {
+        schema: schema_name.clone(),
+    })];
+
+    let gql_schema =
+        build_schema(&introspected, &db_arc, &SchemaOptions::default(), &plugins, None)
+            .expect("schema build");
+
+    // The custom field shows up in the schema and resolves via SQL
+    assert!(gql_schema.sdl().contains("userCount"), "userCount missing from SDL");
+
+    let result = gql_schema.execute("{ userCount }").await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(result.errors.is_empty(), "userCount errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    assert_eq!(data["userCount"], 2);
+}

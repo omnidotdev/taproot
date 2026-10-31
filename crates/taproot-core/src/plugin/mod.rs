@@ -3,6 +3,8 @@ pub mod tags;
 
 pub use smart_comments::SmartCommentsPlugin;
 
+use async_graphql::dynamic::Field;
+
 use crate::introspect::{IntrospectedSchema, TableInfo};
 use crate::planner::PlanNode;
 
@@ -36,5 +38,23 @@ pub trait Plugin: Send + Sync {
     /// mutations). Called once per table after `on_introspect`
     fn filter_table(&self, _table: &TableInfo) -> bool {
         true
+    }
+
+    /// Contribute custom root `Query` fields (the Taproot equivalent of
+    /// Postgraphile's `makeExtendSchemaPlugin`).
+    ///
+    /// Returned fields are added to the generated `Query` type. A field's
+    /// resolver can run SQL via `ctx.data::<Arc<dyn Database>>()` (the pooled
+    /// database handle is registered in the schema data) together with the
+    /// per-request `ctx.data::<RlsContext>()`. `schemas` is the introspected
+    /// metadata, so a plugin can tailor fields to the live schema
+    fn query_fields(&self, _schemas: &[IntrospectedSchema]) -> Vec<Field> {
+        Vec::new()
+    }
+
+    /// Contribute custom root `Mutation` fields. See [`Plugin::query_fields`]
+    /// for how a resolver reaches the database
+    fn mutation_fields(&self, _schemas: &[IntrospectedSchema]) -> Vec<Field> {
+        Vec::new()
     }
 }
