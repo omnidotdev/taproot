@@ -167,9 +167,133 @@ fn decode_jwt_unverified(token: &str) -> Option<String> {
 fn decode_jwt_verified(token: &str, secret: &str) -> Option<String> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false;
+    // Enforce expiry when present, but do not require it: a token carrying an
+    // expired exp is rejected, while a token with no exp is still accepted
+    validation.validate_exp = true;
     validation.required_spec_claims.clear();
 
     let data = decode::<serde_json::Value>(token, &key, &validation).ok()?;
     serde_json::to_string(&data.claims).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn sign(claims: &serde_json::Value, secret: &str) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn bearer(headers: &mut HeaderMap, token: &str) {
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    }
+
+    #[test]
+    fn unverified_decode_extracts_payload() {
+        let token = sign(&serde_json::json!({ "pg_role": "app_user" }), "s");
+        let json = decode_jwt_unverified(&token).expect("payload");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["pg_role"], "app_user");
+    }
+
+    #[test]
+    fn unverified_decode_rejects_malformed() {
+        assert!(decode_jwt_unverified("not-a-jwt").is_none());
+        assert!(decode_jwt_unverified("only.two").is_none());
+    }
+
+    #[test]
+    fn verified_decode_accepts_valid_without_exp() {
+        let token = sign(&serde_json::json!({ "pg_role": "app_user" }), "secret");
+        assert!(decode_jwt_verified(&token, "secret").is_some());
+    }
+
+    #[test]
+    fn verified_decode_accepts_unexpired() {
+        let token = sign(
+            &serde_json::json!({ "pg_role": "app_user", "exp": now_secs() + 3600 }),
+            "secret",
+        );
+        assert!(decode_jwt_verified(&token, "secret").is_some());
+    }
+
+    #[test]
+    fn verified_decode_rejects_expired() {
+        let token = sign(
+            &serde_json::json!({ "pg_role": "app_user", "exp": now_secs() - 3600 }),
+            "secret",
+        );
+        assert!(
+            decode_jwt_verified(&token, "secret").is_none(),
+            "an expired token must be rejected"
+        );
+    }
+
+    #[test]
+    fn verified_decode_rejects_wrong_secret() {
+        let token = sign(&serde_json::json!({ "pg_role": "app_user" }), "right");
+        assert!(decode_jwt_verified(&token, "wrong").is_none());
+    }
+
+    #[test]
+    fn rls_context_empty_when_disabled() {
+        let auth = AuthConfig::default();
+        let ctx = build_rls_context(&auth, &HeaderMap::new());
+        assert!(ctx.role.is_none());
+        assert!(ctx.claims_json.is_none());
+    }
+
+    #[test]
+    fn rls_context_default_role_without_token() {
+        let auth = AuthConfig { rls: true, ..Default::default() };
+        let ctx = build_rls_context(&auth, &HeaderMap::new());
+        assert_eq!(ctx.role.as_deref(), Some("anonymous"));
+        assert!(ctx.claims_json.is_none());
+    }
+
+    #[test]
+    fn rls_context_role_from_claim() {
+        let auth = AuthConfig {
+            rls: true,
+            jwt_secret: Some("secret".into()),
+            ..Default::default()
+        };
+        let token = sign(&serde_json::json!({ "pg_role": "app_user" }), "secret");
+        let mut headers = HeaderMap::new();
+        bearer(&mut headers, &token);
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("app_user"));
+        assert!(ctx.claims_json.is_some());
+    }
+
+    #[test]
+    fn rls_context_expired_token_falls_back_to_default_role() {
+        let auth = AuthConfig {
+            rls: true,
+            jwt_secret: Some("secret".into()),
+            ..Default::default()
+        };
+        let token = sign(
+            &serde_json::json!({ "pg_role": "app_user", "exp": now_secs() - 3600 }),
+            "secret",
+        );
+        let mut headers = HeaderMap::new();
+        bearer(&mut headers, &token);
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("anonymous"));
+    }
 }
