@@ -3648,3 +3648,26 @@ async fn plugin_adds_custom_sql_backed_query_field() {
     let data = result.data.into_json().expect("serialize");
     assert_eq!(data["userCount"], 2);
 }
+
+#[tokio::test]
+async fn relay_query_nested_root() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // The nested `query` root returns the Query type, so fields re-resolve
+    let result = gql_schema
+        .execute("{ query { users { totalCount } } }")
+        .await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(result.errors.is_empty(), "nested query errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    assert_eq!(data["query"]["users"]["totalCount"], 2);
+}
