@@ -56,6 +56,34 @@ fn apply_hooks_recursive(plan: &mut PlanNode, plugins: &[Arc<dyn Plugin>]) {
     }
 }
 
+/// Parse the Relay pagination arguments from a resolver context, decoding the
+/// `after`/`before` cursors into absolute offsets. Negative or malformed
+/// numeric values become `None`.
+fn parse_page_args(ctx: &async_graphql::dynamic::ResolverContext<'_>) -> connection::PageArgs {
+    let uint = |name: &str| {
+        ctx.args
+            .try_get(name)
+            .ok()
+            .and_then(|v| v.i64().ok())
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    let cursor = |name: &str| {
+        ctx.args
+            .try_get(name)
+            .ok()
+            .and_then(|v| v.string().ok().map(str::to_owned))
+            .as_deref()
+            .and_then(connection::decode_cursor)
+    };
+    connection::PageArgs {
+        first: uint("first"),
+        after: cursor("after"),
+        last: uint("last"),
+        before: cursor("before"),
+        offset: uint("offset"),
+    }
+}
+
 /// Build a dynamic `async_graphql` schema from introspected database metadata.
 ///
 /// Each table becomes a `GraphQL` object type, with singular and list root query
@@ -744,41 +772,21 @@ fn build_object_type(
                                 };
 
                             // Apply client-side pagination
-                            #[allow(
-                                clippy::cast_sign_loss,
-                                clippy::cast_possible_truncation
-                            )]
-                            let first = ctx
-                                .args
-                                .try_get("first")
-                                .ok()
-                                .and_then(|v| v.i64().ok())
-                                .map(|n| n.max(0) as usize);
-
-                            let after = ctx
-                                .args
-                                .try_get("after")
-                                .ok()
-                                .and_then(|v| v.string().ok().map(str::to_owned));
-
-                            let offset = after
-                                .as_deref()
-                                .and_then(connection::decode_cursor)
-                                .map_or(0, |n| n + 1);
-                            let limit =
-                                first.unwrap_or(default_page_size).min(max_page_size);
+                            let page_args = parse_page_args(&ctx);
 
                             #[allow(clippy::cast_possible_wrap)]
                             let total_count = all_rows.len() as i64;
+
+                            let window = connection::compute_window(page_args, default_page_size, max_page_size, total_count);
                             let rows: Vec<serde_json::Value> = all_rows
                                 .into_iter()
-                                .skip(offset)
-                                .take(limit)
+                                .skip(window.skip)
+                                .take(window.take)
                                 .collect();
 
                             let response = connection::build_connection_response(
                                 rows,
-                                offset,
+                                window.skip,
                                 total_count,
                             );
 
@@ -800,48 +808,17 @@ fn build_object_type(
 
                         let pk_json = gql_value_to_json(&pk_value);
 
-                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                        let first = ctx
-                            .args
-                            .try_get("first")
-                            .ok()
-                            .and_then(|v| v.i64().ok())
-                            .map(|n| n.max(0) as usize);
-
-                        let after = ctx
-                            .args
-                            .try_get("after")
-                            .ok()
-                            .and_then(|v| v.string().ok().map(str::to_owned));
-
-                        let offset = after
-                            .as_deref()
-                            .and_then(connection::decode_cursor)
-                            .map_or(0, |n| n + 1);
-                        let limit = first.unwrap_or(default_page_size).min(max_page_size);
+                        let page_args = parse_page_args(&ctx);
 
                         let filter = FilterExpr::Eq {
                             column: child_fk_col.clone(),
                             value: pk_json, cast: None,
                         };
 
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut data_plan = PlanNode::Scan {
-                            schema: child_schema.clone(),
-                            table: child_table_name.clone(),
-                            filter: Some(filter.clone()),
-                            order_by: None,
-                            limit: Some(limit as i64),
-                            offset: Some(offset as i64),
-                            selections: vec![],
-                        };
-
-                        apply_on_plan_hooks(&ctx, &mut data_plan);
-
                         let mut count_plan = PlanNode::Scan {
                             schema: child_schema.clone(),
                             table: child_table_name.clone(),
-                            filter: Some(filter),
+                            filter: Some(filter.clone()),
                             order_by: None,
                             limit: None,
                             offset: None,
@@ -855,6 +832,21 @@ fn build_object_type(
                             .map_err(|e| {
                                 async_graphql::Error::new(format!("database error: {e}"))
                             })?;
+
+                        let window = connection::compute_window(page_args, default_page_size, max_page_size, total_count);
+
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut data_plan = PlanNode::Scan {
+                            schema: child_schema.clone(),
+                            table: child_table_name.clone(),
+                            filter: Some(filter),
+                            order_by: None,
+                            limit: Some(window.take as i64),
+                            offset: Some(window.skip as i64),
+                            selections: vec![],
+                        };
+
+                        apply_on_plan_hooks(&ctx, &mut data_plan);
 
                         let rows = execute_plan(&data_plan, &db, rls)
                             .await
@@ -872,14 +864,17 @@ fn build_object_type(
                             .collect();
 
                         let response =
-                            connection::build_connection_response(rows, offset, total_count);
+                            connection::build_connection_response(rows, window.skip, total_count);
 
                         Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
                     })
                 },
             )
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)));
+            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
             object = object.field(field);
         }
@@ -1134,25 +1129,7 @@ fn build_custom_function_query(
                     );
 
                     // Parse pagination args
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    let first = ctx
-                        .args
-                        .try_get("first")
-                        .ok()
-                        .and_then(|v| v.i64().ok())
-                        .map(|n| n.max(0) as usize);
-
-                    let after = ctx
-                        .args
-                        .try_get("after")
-                        .ok()
-                        .and_then(|v| v.string().ok().map(str::to_owned));
-
-                    let offset = after
-                        .as_deref()
-                        .and_then(connection::decode_cursor)
-                        .map_or(0, |n| n + 1);
-                    let limit = first.unwrap_or(default_page_size).min(max_page_size);
+                    let page_args = parse_page_args(&ctx);
 
                     // Count query
                     let count_sql = format!(
@@ -1170,6 +1147,8 @@ fn build_custom_function_query(
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or(0);
 
+                    let window = connection::compute_window(page_args, default_page_size, max_page_size, total_count);
+
                     // Data query
                     let param_count = params.len();
                     let data_sql = format!(
@@ -1182,8 +1161,8 @@ fn build_custom_function_query(
                     let mut data_params = params;
                     #[allow(clippy::cast_possible_wrap)]
                     {
-                        data_params.push(serde_json::json!(limit as i64));
-                        data_params.push(serde_json::json!(offset as i64));
+                        data_params.push(serde_json::json!(window.take as i64));
+                        data_params.push(serde_json::json!(window.skip as i64));
                     }
 
                     let rows = db
@@ -1213,7 +1192,7 @@ fn build_custom_function_query(
                         .collect();
 
                     let response = connection::build_connection_response(
-                        rows, offset, total_count,
+                        rows, window.skip, total_count,
                     );
 
                     Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))
@@ -1237,7 +1216,10 @@ fn build_custom_function_query(
         // Add pagination arguments
         field = field
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)));
+            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
         field
     } else if returns_set {
@@ -1663,19 +1645,7 @@ fn build_list_query(
                 let condition_json = extract_json_arg(&ctx, "condition");
                 let order_json = extract_json_arg(&ctx, "orderBy");
 
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let first = ctx
-                    .args
-                    .try_get("first")
-                    .ok()
-                    .and_then(|v| v.i64().ok())
-                    .map(|n| n.max(0) as usize);
-
-                let after = ctx
-                    .args
-                    .try_get("after")
-                    .ok()
-                    .and_then(|v| v.string().ok().map(str::to_owned));
+                let page_args = parse_page_args(&ctx);
 
                 // Convert condition JSON to FilterExpr
                 let filter = condition_json
@@ -1688,39 +1658,16 @@ fn build_list_query(
                     .map(|o| order_to_exprs(o, &table_info.columns))
                     .filter(|v| !v.is_empty());
 
-                // Cursor-based offset
-                let offset = after
-                    .as_deref()
-                    .and_then(connection::decode_cursor)
-                    .map_or(0, |n| n + 1);
-                let limit = first.unwrap_or(default_page_size).min(max_page_size);
-
                 // Build lateral joins for has-many relationships
                 let mut visited = HashSet::new();
                 let lateral_selections = build_lateral_selections(&table_info, &all_tables_for_lateral, &mut visited);
 
-                // Build plan for data query
-                #[allow(clippy::cast_possible_wrap)]
-                let mut data_plan = PlanNode::Scan {
-                    schema: schema_name.clone(),
-                    table: table_name.clone(),
-                    filter: filter.clone(),
-                    order_by: order_by.clone(),
-                    limit: Some(limit as i64),
-                    offset: Some(offset as i64),
-                    selections: lateral_selections,
-                };
-
-                apply_on_plan_hooks(&ctx, &mut data_plan);
-
-                // Keep a copy of the filter for the aggregate query
-                let agg_filter = filter.clone();
-
-                // Build plan for count query
+                // Run the count query first so backward pagination (last/before)
+                // can resolve its window against the total
                 let mut count_plan = PlanNode::Scan {
                     schema: schema_name.clone(),
                     table: table_name.clone(),
-                    filter,
+                    filter: filter.clone(),
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -1732,6 +1679,25 @@ fn build_list_query(
                 let total_count = execute_plan_count(&count_plan, &db, rls)
                     .await
                     .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                let window = connection::compute_window(page_args, default_page_size, max_page_size, total_count);
+
+                // Build plan for data query
+                #[allow(clippy::cast_possible_wrap)]
+                let mut data_plan = PlanNode::Scan {
+                    schema: schema_name.clone(),
+                    table: table_name.clone(),
+                    filter: filter.clone(),
+                    order_by: order_by.clone(),
+                    limit: Some(window.take as i64),
+                    offset: Some(window.skip as i64),
+                    selections: lateral_selections,
+                };
+
+                apply_on_plan_hooks(&ctx, &mut data_plan);
+
+                // Keep the filter for the aggregate query
+                let agg_filter = filter;
 
                 let rows = execute_plan(&data_plan, &db, rls)
                     .await
@@ -1769,7 +1735,7 @@ fn build_list_query(
                     .collect();
 
                 let mut response =
-                    connection::build_connection_response(rows, offset, total_count);
+                    connection::build_connection_response(rows, window.skip, total_count);
 
                 // Attach aggregate data to the connection response
                 if let serde_json::Value::Object(ref mut map) = response {
@@ -1790,6 +1756,9 @@ fn build_list_query(
     ))
     .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
     .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
 }
 
 /// Extract a JSON argument from the resolver context, returning `None` for
