@@ -2125,14 +2125,17 @@ fn build_nested_rel_inputs(
             }
 
             let child_type = to_pascal_case(&singularize(&other_table.name));
+            // Mirror the read-side has-many relation naming: pluralize the
+            // singular form so an already-plural table name is not doubled
+            // (e.g. `posts` -> `postsByAuthorId`, not `postsesByAuthorId`)
             let rel_field_name = format!(
                 "{}By{}",
-                to_camel_case(&pluralize(&other_table.name)),
+                pluralize(&to_camel_case(&singularize(&other_table.name))),
                 to_pascal_case(&fk.columns[0]),
             );
             let pascal_rel_field = format!(
                 "{}By{}",
-                to_pascal_case(&pluralize(&other_table.name)),
+                to_pascal_case(&pluralize(&singularize(&other_table.name))),
                 to_pascal_case(&fk.columns[0]),
             );
 
@@ -2195,10 +2198,29 @@ fn register_mutation_types(
             build_nested_rel_inputs(schema_builder, table, type_name, enum_names, all_tables);
         schema_builder = sb;
 
+        // Foreign-key columns covered by a belongs-to nested relationship are
+        // made optional on the create input (the related row may be supplied
+        // via the nested `create`/`connect` field instead of the raw key)
+        let belongs_to_fk_columns: HashSet<String> = nested_rels
+            .iter()
+            .filter_map(|rel| match &rel.direction {
+                mutations::NestedRelDirection::BelongsTo { fk_columns, .. } => {
+                    Some(fk_columns.clone())
+                }
+                mutations::NestedRelDirection::HasMany { .. } => None,
+            })
+            .flatten()
+            .collect();
+
         schema_builder =
             schema_builder.register(mutations::build_on_conflict_input(type_name));
-        schema_builder =
-            schema_builder.register(mutations::build_create_input(table, type_name, enum_names, &nested_fields));
+        schema_builder = schema_builder.register(mutations::build_create_input(
+            table,
+            type_name,
+            enum_names,
+            &nested_fields,
+            &belongs_to_fk_columns,
+        ));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Create{type_name}"),
             table_field_name,

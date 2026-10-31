@@ -162,6 +162,7 @@ pub fn build_create_input(
     type_name: &str,
     enum_names: &HashSet<String>,
     nested_fields: &[NestedRelField],
+    optional_columns: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Create{type_name}Input");
     let on_conflict_type = format!("{type_name}OnConflict");
@@ -178,7 +179,16 @@ pub fn build_create_input(
         }
 
         let field_name = to_camel_case(&col.name);
-        let type_ref = create_input_type_ref(col, enum_names);
+        // A foreign-key column covered by a belongs-to nested relationship is
+        // always optional: the caller may supply the related row via the nested
+        // `create`/`connect` field instead of the raw key, and the resolver
+        // fills the key from it
+        let type_ref = if optional_columns.contains(&col.name) {
+            let (gql_type, _) = resolve_column_type_for_input(col, enum_names);
+            TypeRef::named(gql_type)
+        } else {
+            create_input_type_ref(col, enum_names)
+        };
         input = input.field(InputValue::new(field_name, type_ref));
     }
 
