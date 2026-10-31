@@ -102,7 +102,7 @@ fn camel_case(s: &str) -> String {
 /// GraphQL field name for a database column.
 ///
 /// A column literally named `id` is exposed as `rowId` (matching
-/// `PgSimplifyInflection`, which reserves `id` for a global identifier); every
+/// a common convention that reserves `id` for a global identifier); every
 /// other column is camelCased
 #[must_use]
 pub fn column_field_name(column: &str) -> String {

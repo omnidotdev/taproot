@@ -28,7 +28,7 @@ Open `http://localhost:4000/graphql` in a browser to explore your API with Graph
 
 ## Features
 
-- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types. A column named `id` is exposed as `rowId` (matching `PgSimplifyInflection`)
+- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types. A column named `id` is exposed as `rowId` (a common convention)
 - **Relay pagination** — cursor-based connections with `first`/`after`/`last`/`before`/`offset`
 - **Filtering** — a flat `condition` for per-column equality, plus a rich `filter` with `equalTo`, `notEqualTo`, `in`, `notIn`, `lessThan`, `lessThanOrEqualTo`, `greaterThan`, `greaterThanOrEqualTo`, `isNull`, string operators (`includes`, `includesInsensitive`, `startsWith`, `endsWith`, `like`, `likeInsensitive`, ...), array-column membership (`anyEqualTo`, `anyGreaterThan`, ...), and `and`/`or`/`not` combinators
 - **Mutations** — auto-generated `create`, `update`, `delete` operations, bulk variants, and nested `create`/`connect` for related records, for tables with single-column primary keys
@@ -75,6 +75,23 @@ auth:
 subscriptions:
   enabled: false
   notify_channel: "graphql_subscriptions"
+```
+
+## Development
+
+Requires a nightly Rust toolchain (pinned in `rust-toolchain.toml`) and, for the integration tests, a reachable PostgreSQL instance.
+
+```bash
+# Unit + integration suite (integration tests need a database; they create and
+# drop their own schemas, so point this at a throwaway DB — when unset they skip)
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/taproot_test"
+cargo test
+
+# Lint
+cargo clippy --all-targets
+
+# Build the server binary
+cargo build --release -p taproot-server
 ```
 
 ## Documentation

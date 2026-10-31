@@ -3566,7 +3566,7 @@ async fn nested_mutation_respects_omit_create_on_related_table() {
 }
 
 /// Plugin that adds a custom `userCount` root query backed by SQL, exercising
-/// the makeExtendSchemaPlugin-parity hook.
+/// the schema-extension hook.
 struct UserCountPlugin {
     schema: String,
 }

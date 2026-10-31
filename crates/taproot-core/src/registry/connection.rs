@@ -1,4 +1,4 @@
-//! Relay-style cursor pagination types compatible with `PostGraphile` v5
+//! Relay-style cursor pagination types
 //!
 //! Provides cursor encoding/decoding, connection/edge/page-info type builders,
 //! and a response builder that assembles the JSON structure resolvers expect.

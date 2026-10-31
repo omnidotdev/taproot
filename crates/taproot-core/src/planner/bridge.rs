@@ -10,7 +10,7 @@ fn escape_like(s: &str) -> String {
 }
 
 /// Convert a single column's `{Scalar}Filter` operator object into
-/// `FilterExpr`s, using the `PostGraphile` `ConnectionFilterPlugin` operator
+/// `FilterExpr`s, using the standard connection-filter operator
 /// names
 fn parse_filter_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterExpr> {
     let Some(obj) = ops.as_object() else {
@@ -150,8 +150,8 @@ pub fn condition_to_filter(
 ) -> Option<FilterExpr> {
     let obj = condition.as_object()?;
 
-    // `condition` is a flat set of per-column equality checks (PostGraphile
-    // shape): `{ field: value }`. Richer querying goes through `filter`
+    // `condition` is a flat set of per-column equality checks of the form
+    // `{ field: value }`. Richer querying goes through `filter`
     let mut filters = Vec::new();
     for (key, val) in obj {
         if let Some(col) = columns
@@ -175,7 +175,7 @@ pub fn condition_to_filter(
 ///
 /// Supports per-column `{Scalar}Filter` operator objects (see
 /// [`parse_filter_ops`]) and the `and`, `or`, `not` combinators (the
-/// `PostGraphile` `ConnectionFilterPlugin` shape).
+/// standard connection-filter shape).
 #[must_use]
 pub fn filter_to_filter(
     filter: &Value,

@@ -393,8 +393,7 @@ pub fn build_schema(
         }
     }
 
-    // Custom root fields contributed by plugins (Postgraphile
-    // makeExtendSchemaPlugin parity)
+    // Custom root fields contributed by plugins
     for plugin in plugins {
         for field in plugin.query_fields(&schemas) {
             query = query.field(field);
