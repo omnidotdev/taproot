@@ -296,4 +296,58 @@ mod tests {
         let ctx = build_rls_context(&auth, &headers);
         assert_eq!(ctx.role.as_deref(), Some("anonymous"));
     }
+
+    #[test]
+    fn rls_context_non_bearer_header_uses_default_role() {
+        let auth = AuthConfig { rls: true, ..Default::default() };
+        let mut headers = HeaderMap::new();
+        // Missing the "Bearer " prefix: treated as no token
+        headers.insert("authorization", "Basic abc123".parse().unwrap());
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("anonymous"));
+        assert!(ctx.claims_json.is_none());
+    }
+
+    #[test]
+    fn rls_context_unverified_mode_extracts_role() {
+        // No jwt_secret => trust an upstream-verified token, decode without
+        // checking the signature, but still extract the role claim
+        let auth = AuthConfig { rls: true, jwt_secret: None, ..Default::default() };
+        let token = sign(&serde_json::json!({ "pg_role": "app_user" }), "whatever");
+        let mut headers = HeaderMap::new();
+        bearer(&mut headers, &token);
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("app_user"));
+        assert!(ctx.claims_json.is_some());
+    }
+
+    #[test]
+    fn rls_context_missing_role_claim_uses_default() {
+        let auth = AuthConfig {
+            rls: true,
+            jwt_secret: Some("secret".into()),
+            ..Default::default()
+        };
+        let token = sign(&serde_json::json!({ "sub": "u1" }), "secret");
+        let mut headers = HeaderMap::new();
+        bearer(&mut headers, &token);
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("anonymous"));
+        // Claims are still passed through to Postgres even without a role
+        assert!(ctx.claims_json.is_some());
+    }
+
+    #[test]
+    fn rls_context_non_string_role_claim_uses_default() {
+        let auth = AuthConfig {
+            rls: true,
+            jwt_secret: Some("secret".into()),
+            ..Default::default()
+        };
+        let token = sign(&serde_json::json!({ "pg_role": 42 }), "secret");
+        let mut headers = HeaderMap::new();
+        bearer(&mut headers, &token);
+        let ctx = build_rls_context(&auth, &headers);
+        assert_eq!(ctx.role.as_deref(), Some("anonymous"));
+    }
 }
