@@ -1399,7 +1399,11 @@ fn build_singular_query(
     let field_name = if pk_cols.len() == 1 {
         to_camel_case(&singular)
     } else {
-        let suffix: String = pk_cols.iter().map(|c| to_pascal_case(&c.name)).collect();
+        let suffix = pk_cols
+            .iter()
+            .map(|c| to_pascal_case(&c.name))
+            .collect::<Vec<_>>()
+            .join("And");
         format!("{}By{suffix}", to_camel_case(&singular))
     };
 
