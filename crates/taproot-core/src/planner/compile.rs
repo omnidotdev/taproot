@@ -10,8 +10,15 @@ fn quote_ident(name: &str) -> String {
 }
 
 /// Compile a binary comparison operator (Eq, Ne, Gt, etc.)
-fn compile_binop(column: &str, op: &str, value: &Value, param_offset: usize) -> (String, Vec<Value>) {
-    let sql = format!("{} {op} ${param_offset}", quote_ident(column));
+fn compile_binop(
+    column: &str,
+    op: &str,
+    value: &Value,
+    param_offset: usize,
+    cast: Option<&str>,
+) -> (String, Vec<Value>) {
+    let cast = cast.unwrap_or_default();
+    let sql = format!("{} {op} ${param_offset}{cast}", quote_ident(column));
     (sql, vec![value.clone()])
 }
 
@@ -23,16 +30,29 @@ fn compile_binop(column: &str, op: &str, value: &Value, param_offset: usize) -> 
 #[must_use]
 pub fn compile_filter(expr: &FilterExpr, param_offset: usize) -> (String, Vec<Value>) {
     match expr {
-        FilterExpr::Eq { column, value } => compile_binop(column, "=", value, param_offset),
-        FilterExpr::Ne { column, value } => compile_binop(column, "!=", value, param_offset),
-        FilterExpr::Gt { column, value } => compile_binop(column, ">", value, param_offset),
-        FilterExpr::Gte { column, value } => compile_binop(column, ">=", value, param_offset),
-        FilterExpr::Lt { column, value } => compile_binop(column, "<", value, param_offset),
-        FilterExpr::Lte { column, value } => compile_binop(column, "<=", value, param_offset),
+        FilterExpr::Eq { column, value, cast } => {
+            compile_binop(column, "=", value, param_offset, cast.as_deref())
+        }
+        FilterExpr::Ne { column, value, cast } => {
+            compile_binop(column, "!=", value, param_offset, cast.as_deref())
+        }
+        FilterExpr::Gt { column, value, cast } => {
+            compile_binop(column, ">", value, param_offset, cast.as_deref())
+        }
+        FilterExpr::Gte { column, value, cast } => {
+            compile_binop(column, ">=", value, param_offset, cast.as_deref())
+        }
+        FilterExpr::Lt { column, value, cast } => {
+            compile_binop(column, "<", value, param_offset, cast.as_deref())
+        }
+        FilterExpr::Lte { column, value, cast } => {
+            compile_binop(column, "<=", value, param_offset, cast.as_deref())
+        }
 
-        FilterExpr::In { column, values } => {
+        FilterExpr::In { column, values, cast } => {
+            let cast = cast.as_deref().unwrap_or_default();
             let placeholders: Vec<String> = (0..values.len())
-                .map(|i| format!("${}", param_offset + i))
+                .map(|i| format!("${}{cast}", param_offset + i))
                 .collect();
             let sql = format!("{} IN ({})", quote_ident(column), placeholders.join(", "));
             (sql, values.clone())
@@ -440,7 +460,7 @@ mod tests {
 
     #[test]
     fn compile_eq() {
-        let expr = FilterExpr::Eq { column: "name".into(), value: serde_json::json!("Alice") };
+        let expr = FilterExpr::Eq { column: "name".into(), value: serde_json::json!("Alice"), cast: None };
         let (sql, params) = compile_filter(&expr, 1);
         assert_eq!(sql, "\"name\" = $1");
         assert_eq!(params, vec![serde_json::json!("Alice")]);
@@ -448,7 +468,7 @@ mod tests {
 
     #[test]
     fn compile_in() {
-        let expr = FilterExpr::In { column: "id".into(), values: vec![serde_json::json!("a"), serde_json::json!("b")] };
+        let expr = FilterExpr::In { column: "id".into(), values: vec![serde_json::json!("a"), serde_json::json!("b")], cast: None };
         let (sql, params) = compile_filter(&expr, 1);
         assert_eq!(sql, "\"id\" IN ($1, $2)");
         assert_eq!(params.len(), 2);
@@ -473,8 +493,8 @@ mod tests {
     #[test]
     fn compile_and() {
         let expr = FilterExpr::And(vec![
-            FilterExpr::Eq { column: "a".into(), value: serde_json::json!(1) },
-            FilterExpr::Eq { column: "b".into(), value: serde_json::json!(2) },
+            FilterExpr::Eq { column: "a".into(), value: serde_json::json!(1), cast: None },
+            FilterExpr::Eq { column: "b".into(), value: serde_json::json!(2), cast: None },
         ]);
         let (sql, params) = compile_filter(&expr, 1);
         assert_eq!(sql, "(\"a\" = $1 AND \"b\" = $2)");
@@ -484,8 +504,8 @@ mod tests {
     #[test]
     fn compile_or() {
         let expr = FilterExpr::Or(vec![
-            FilterExpr::Eq { column: "x".into(), value: serde_json::json!(1) },
-            FilterExpr::Eq { column: "y".into(), value: serde_json::json!(2) },
+            FilterExpr::Eq { column: "x".into(), value: serde_json::json!(1), cast: None },
+            FilterExpr::Eq { column: "y".into(), value: serde_json::json!(2), cast: None },
         ]);
         let (sql, params) = compile_filter(&expr, 1);
         assert_eq!(sql, "(\"x\" = $1 OR \"y\" = $2)");
@@ -494,7 +514,7 @@ mod tests {
 
     #[test]
     fn compile_not() {
-        let expr = FilterExpr::Not(Box::new(FilterExpr::Eq { column: "active".into(), value: serde_json::json!(false) }));
+        let expr = FilterExpr::Not(Box::new(FilterExpr::Eq { column: "active".into(), value: serde_json::json!(false), cast: None }));
         let (sql, params) = compile_filter(&expr, 1);
         assert_eq!(sql, "NOT (\"active\" = $1)");
         assert_eq!(params.len(), 1);
@@ -510,7 +530,7 @@ mod tests {
 
     #[test]
     fn compile_param_offset() {
-        let expr = FilterExpr::Eq { column: "x".into(), value: serde_json::json!(42) };
+        let expr = FilterExpr::Eq { column: "x".into(), value: serde_json::json!(42), cast: None };
         let (sql, _) = compile_filter(&expr, 5);
         assert_eq!(sql, "\"x\" = $5");
     }
@@ -526,11 +546,11 @@ mod tests {
     #[test]
     fn compile_comparison_operators() {
         for (expr, op) in [
-            (FilterExpr::Gt { column: "a".into(), value: serde_json::json!(1) }, ">"),
-            (FilterExpr::Gte { column: "a".into(), value: serde_json::json!(1) }, ">="),
-            (FilterExpr::Lt { column: "a".into(), value: serde_json::json!(1) }, "<"),
-            (FilterExpr::Lte { column: "a".into(), value: serde_json::json!(1) }, "<="),
-            (FilterExpr::Ne { column: "a".into(), value: serde_json::json!(1) }, "!="),
+            (FilterExpr::Gt { column: "a".into(), value: serde_json::json!(1), cast: None }, ">"),
+            (FilterExpr::Gte { column: "a".into(), value: serde_json::json!(1), cast: None }, ">="),
+            (FilterExpr::Lt { column: "a".into(), value: serde_json::json!(1), cast: None }, "<"),
+            (FilterExpr::Lte { column: "a".into(), value: serde_json::json!(1), cast: None }, "<="),
+            (FilterExpr::Ne { column: "a".into(), value: serde_json::json!(1), cast: None }, "!="),
         ] {
             let (sql, _) = compile_filter(&expr, 1);
             assert_eq!(sql, format!("\"a\" {op} $1"));
@@ -558,7 +578,7 @@ mod tests {
         let plan = PlanNode::Scan {
             schema: "public".into(),
             table: "users".into(),
-            filter: Some(FilterExpr::Eq { column: "id".into(), value: serde_json::json!("abc") }),
+            filter: Some(FilterExpr::Eq { column: "id".into(), value: serde_json::json!("abc"), cast: None }),
             order_by: None,
             limit: None,
             offset: None,
@@ -652,7 +672,7 @@ mod tests {
                 child_key: "author_id".into(),
                 filter: Some(FilterExpr::Eq {
                     column: "published".into(),
-                    value: serde_json::json!(true),
+                    value: serde_json::json!(true), cast: None,
                 }),
                 order_by: None,
                 limit: None,
@@ -703,7 +723,7 @@ mod tests {
             table: "users".into(),
             filter: Some(FilterExpr::Eq {
                 column: "active".into(),
-                value: serde_json::json!(true),
+                value: serde_json::json!(true), cast: None,
             }),
             order_by: None,
             limit: None,
@@ -775,7 +795,7 @@ mod tests {
             table: "users".into(),
             filter: Some(FilterExpr::Eq {
                 column: "active".into(),
-                value: serde_json::json!(true),
+                value: serde_json::json!(true), cast: None,
             }),
             order_by: None,
             limit: None,
@@ -787,7 +807,7 @@ mod tests {
                 child_key: "author_id".into(),
                 filter: Some(FilterExpr::Eq {
                     column: "published".into(),
-                    value: serde_json::json!(true),
+                    value: serde_json::json!(true), cast: None,
                 }),
                 order_by: None,
                 limit: None,
@@ -854,7 +874,7 @@ mod tests {
             table: "users".into(),
             filter: Some(FilterExpr::Eq {
                 column: "active".into(),
-                value: serde_json::json!(true),
+                value: serde_json::json!(true), cast: None,
             }),
             order_by: None,
             limit: None,
@@ -866,7 +886,7 @@ mod tests {
                 child_key: "author_id".into(),
                 filter: Some(FilterExpr::Eq {
                     column: "published".into(),
-                    value: serde_json::json!(true),
+                    value: serde_json::json!(true), cast: None,
                 }),
                 order_by: None,
                 limit: None,
@@ -878,7 +898,7 @@ mod tests {
                     child_key: "post_id".into(),
                     filter: Some(FilterExpr::Eq {
                         column: "approved".into(),
-                        value: serde_json::json!(true),
+                        value: serde_json::json!(true), cast: None,
                     }),
                     order_by: None,
                     limit: None,
@@ -899,7 +919,7 @@ mod tests {
         let plan = PlanNode::Scan {
             schema: "public".into(),
             table: "posts".into(),
-            filter: Some(FilterExpr::Eq { column: "author_id".into(), value: serde_json::json!("u1") }),
+            filter: Some(FilterExpr::Eq { column: "author_id".into(), value: serde_json::json!("u1"), cast: None }),
             order_by: None,
             limit: None,
             offset: None,

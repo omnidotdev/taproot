@@ -27,13 +27,22 @@ pub async fn introspect(
         let composite_types = fetch_composite_types(db, schema_name).await?;
         let functions = fetch_functions(db, schema_name).await?;
 
-        schemas.push(IntrospectedSchema {
+        let mut introspected = IntrospectedSchema {
             name: schema_name.clone(),
             tables,
             enums,
             composite_types,
             functions,
-        });
+        };
+
+        // Parse `@tag` smart comments into table/column metadata when enabled,
+        // so the option takes effect without the caller having to wire the
+        // SmartCommentsPlugin explicitly
+        if options.smart_comments {
+            crate::plugin::smart_comments::apply_smart_comments(&mut introspected);
+        }
+
+        schemas.push(introspected);
     }
 
     Ok(schemas)
@@ -375,7 +384,9 @@ async fn fetch_functions(db: &dyn Database, schema: &str) -> Result<Vec<Function
             n.nspname AS schema,
             pg_catalog.format_type(p.prorettype, NULL) AS return_type,
             p.proretset AS returns_set,
-            p.provolatile AS volatility,
+            -- provolatile is Postgres's internal \"char\" type, which the row decoder
+            -- cannot read as a String, so cast to text (it is consumed as its first char)
+            p.provolatile::text AS volatility,
             pg_catalog.pg_get_function_arguments(p.oid) AS arg_string,
             COALESCE(
                 (SELECT c.relname FROM pg_catalog.pg_class c
@@ -387,9 +398,7 @@ async fn fetch_functions(db: &dyn Database, schema: &str) -> Result<Vec<Function
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
         WHERE n.nspname = '{schema}'
-          AND p.prokind = 'f'
-          AND NOT p.proisagg
-          AND NOT p.proiswindow"
+          AND p.prokind = 'f'"
     );
 
     let rows = db.query_raw(&sql).await?;

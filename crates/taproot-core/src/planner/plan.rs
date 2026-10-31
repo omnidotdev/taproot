@@ -49,13 +49,13 @@ pub enum PlanNode {
 /// A filter expression that compiles to a SQL WHERE clause
 #[derive(Debug, Clone)]
 pub enum FilterExpr {
-    Eq { column: String, value: Value },
-    Ne { column: String, value: Value },
-    Gt { column: String, value: Value },
-    Gte { column: String, value: Value },
-    Lt { column: String, value: Value },
-    Lte { column: String, value: Value },
-    In { column: String, values: Vec<Value> },
+    Eq { column: String, value: Value, cast: Option<String> },
+    Ne { column: String, value: Value, cast: Option<String> },
+    Gt { column: String, value: Value, cast: Option<String> },
+    Gte { column: String, value: Value, cast: Option<String> },
+    Lt { column: String, value: Value, cast: Option<String> },
+    Lte { column: String, value: Value, cast: Option<String> },
+    In { column: String, values: Vec<Value>, cast: Option<String> },
     Like { column: String, pattern: String },
     ILike { column: String, pattern: String },
     IsNull { column: String, is_null: bool },
@@ -126,7 +126,7 @@ mod tests {
             table: "users".into(),
             filter: Some(FilterExpr::Eq {
                 column: "id".into(),
-                value: serde_json::json!("abc-123"),
+                value: serde_json::json!("abc-123"), cast: None,
             }),
             order_by: None,
             limit: None,
@@ -171,7 +171,7 @@ mod tests {
         let expr = FilterExpr::And(vec![
             FilterExpr::Eq {
                 column: "name".into(),
-                value: serde_json::json!("Alice"),
+                value: serde_json::json!("Alice"), cast: None,
             },
             FilterExpr::IsNull {
                 column: "deleted_at".into(),

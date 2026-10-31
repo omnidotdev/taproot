@@ -10,10 +10,14 @@ fn escape_like(s: &str) -> String {
 }
 
 /// Convert a single column's operator object into a `FilterExpr`
-fn parse_column_ops(column: &str, ops: &Value) -> Vec<FilterExpr> {
+fn parse_column_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterExpr> {
     let Some(obj) = ops.as_object() else {
         return Vec::new();
     };
+
+    let column = col.name.as_str();
+    let suffix = col.pg_cast_suffix(schema);
+    let cast = if suffix.is_empty() { None } else { Some(suffix) };
 
     let mut filters = Vec::new();
 
@@ -22,35 +26,43 @@ fn parse_column_ops(column: &str, ops: &Value) -> Vec<FilterExpr> {
             "eq" => Some(FilterExpr::Eq {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "ne" | "notEq" => Some(FilterExpr::Ne {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "gt" | "greaterThan" => Some(FilterExpr::Gt {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "gte" | "greaterThanOrEqualTo" => Some(FilterExpr::Gte {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "lt" | "lessThan" => Some(FilterExpr::Lt {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "lte" | "lessThanOrEqualTo" => Some(FilterExpr::Lte {
                 column: column.to_string(),
                 value: val.clone(),
+                cast: cast.clone(),
             }),
             "in" => val.as_array().map(|arr| FilterExpr::In {
                 column: column.to_string(),
                 values: arr.clone(),
+                cast: cast.clone(),
             }),
             "notIn" => val.as_array().map(|arr| {
                 FilterExpr::Not(Box::new(FilterExpr::In {
                     column: column.to_string(),
                     values: arr.clone(),
+                    cast: cast.clone(),
                 }))
             }),
             "like" => val.as_str().map(|s| FilterExpr::Like {
@@ -101,7 +113,11 @@ fn combine_filters(mut filters: Vec<FilterExpr>) -> Option<FilterExpr> {
 /// logical combinators (`and`, `or`, `not`). Unknown columns are silently
 /// skipped
 #[must_use]
-pub fn condition_to_filter(condition: &Value, columns: &[ColumnInfo]) -> Option<FilterExpr> {
+pub fn condition_to_filter(
+    condition: &Value,
+    columns: &[ColumnInfo],
+    schema: &str,
+) -> Option<FilterExpr> {
     let obj = condition.as_object()?;
 
     let mut filters = Vec::new();
@@ -112,7 +128,7 @@ pub fn condition_to_filter(condition: &Value, columns: &[ColumnInfo]) -> Option<
                 if let Some(arr) = val.as_array() {
                     let sub: Vec<FilterExpr> = arr
                         .iter()
-                        .filter_map(|item| condition_to_filter(item, columns))
+                        .filter_map(|item| condition_to_filter(item, columns, schema))
                         .collect();
                     if !sub.is_empty() {
                         filters.push(FilterExpr::And(sub));
@@ -123,7 +139,7 @@ pub fn condition_to_filter(condition: &Value, columns: &[ColumnInfo]) -> Option<
                 if let Some(arr) = val.as_array() {
                     let sub: Vec<FilterExpr> = arr
                         .iter()
-                        .filter_map(|item| condition_to_filter(item, columns))
+                        .filter_map(|item| condition_to_filter(item, columns, schema))
                         .collect();
                     if !sub.is_empty() {
                         filters.push(FilterExpr::Or(sub));
@@ -131,15 +147,14 @@ pub fn condition_to_filter(condition: &Value, columns: &[ColumnInfo]) -> Option<
                 }
             }
             "not" => {
-                if let Some(inner) = condition_to_filter(val, columns) {
+                if let Some(inner) = condition_to_filter(val, columns, schema) {
                     filters.push(FilterExpr::Not(Box::new(inner)));
                 }
             }
             column_name => {
                 // Skip unknown columns
-                let is_known = columns.iter().any(|c| c.name == column_name);
-                if is_known {
-                    filters.extend(parse_column_ops(column_name, val));
+                if let Some(col) = columns.iter().find(|c| c.name == column_name) {
+                    filters.extend(parse_column_ops(col, val, schema));
                 }
             }
         }
@@ -223,63 +238,63 @@ mod tests {
     #[test]
     fn simple_eq_condition() {
         let condition = serde_json::json!({ "name": { "eq": "Alice" } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn multiple_columns() {
         let condition = serde_json::json!({ "name": { "eq": "Alice" }, "email": { "like": "%example%" } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn and_combinator() {
         let condition = serde_json::json!({ "and": [{ "name": { "eq": "Alice" } }, { "email": { "eq": "alice@example.com" } }] });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn or_combinator() {
         let condition = serde_json::json!({ "or": [{ "name": { "eq": "Alice" } }, { "name": { "eq": "Bob" } }] });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn not_combinator() {
         let condition = serde_json::json!({ "not": { "name": { "eq": "Alice" } } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn is_null_filter() {
         let condition = serde_json::json!({ "email": { "isNull": true } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn in_filter() {
         let condition = serde_json::json!({ "name": { "in": ["Alice", "Bob"] } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn empty_condition_returns_none() {
         let condition = serde_json::json!({});
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_none());
     }
 
     #[test]
     fn unknown_column_ignored() {
         let condition = serde_json::json!({ "nonexistent": { "eq": "x" } });
-        let result = condition_to_filter(&condition, &test_columns());
+        let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_none());
     }
 

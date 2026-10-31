@@ -33,8 +33,31 @@ const NUMERIC_UDTS: &[&str] = &[
     "money",
 ];
 
-/// UDT names that are not orderable (excluded from min/max)
-const NON_ORDERABLE_UDTS: &[&str] = &["json", "jsonb"];
+/// Non-numeric UDT names that Postgres supports `min`/`max` on. Combined with
+/// the numeric set this forms an allowlist: a type is eligible for min/max only
+/// if it appears here or is numeric. An allowlist (rather than a denylist) is
+/// deliberate: Postgres has no `min`/`max` aggregate for many types (`uuid`,
+/// `bool`, `json`/`jsonb`, geometric, `bytea`, arrays, composites, ...), and
+/// emitting `MIN(col)` for any of them fails the whole query, whereas omitting
+/// a min/max field for an unrecognized-but-orderable type is harmless.
+const ORDERABLE_UDTS: &[&str] = &[
+    "text",
+    "varchar",
+    "bpchar",
+    "char",
+    "name",
+    "citext",
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "inet",
+    "cidr",
+    "macaddr",
+    "macaddr8",
+];
 
 /// Check whether a column's UDT is numeric
 #[must_use]
@@ -42,10 +65,11 @@ fn is_numeric(col: &ColumnInfo) -> bool {
     NUMERIC_UDTS.contains(&col.udt_name.as_str())
 }
 
-/// Check whether a column's UDT is orderable (eligible for min/max)
+/// Check whether a column's UDT is orderable (eligible for min/max). Allowlist:
+/// numeric types plus scalar string, date/time, and network types.
 #[must_use]
 fn is_orderable(col: &ColumnInfo) -> bool {
-    !NON_ORDERABLE_UDTS.contains(&col.udt_name.as_str())
+    is_numeric(col) || ORDERABLE_UDTS.contains(&col.udt_name.as_str())
 }
 
 /// Quote a SQL identifier, escaping embedded double quotes

@@ -421,7 +421,7 @@ pub fn build_schema(
                                         table: table_name.clone(),
                                         filter: Some(FilterExpr::Eq {
                                             column: pk_col.clone(),
-                                            value: serde_json::json!(notif.id),
+                                            value: serde_json::json!(notif.id), cast: None,
                                         }),
                                         order_by: None,
                                         limit: Some(1),
@@ -499,7 +499,7 @@ pub fn build_schema(
                         let json_value = gql_value_to_json(key_value.as_value());
                         filter_parts.push(FilterExpr::Eq {
                             column: col_name.clone(),
-                            value: json_value,
+                            value: json_value, cast: None,
                         });
                     }
 
@@ -822,7 +822,7 @@ fn build_object_type(
 
                         let filter = FilterExpr::Eq {
                             column: child_fk_col.clone(),
-                            value: pk_json,
+                            value: pk_json, cast: None,
                         };
 
                         #[allow(clippy::cast_possible_wrap)]
@@ -1399,7 +1399,11 @@ fn build_singular_query(
     let field_name = if pk_cols.len() == 1 {
         to_camel_case(&singular)
     } else {
-        let suffix: String = pk_cols.iter().map(|c| to_pascal_case(&c.name)).collect();
+        let suffix = pk_cols
+            .iter()
+            .map(|c| to_pascal_case(&c.name))
+            .collect::<Vec<_>>()
+            .join("And");
         format!("{}By{suffix}", to_camel_case(&singular))
     };
 
@@ -1435,7 +1439,7 @@ fn build_singular_query(
                     let json_value = value_accessor_to_json(&arg_value);
                     filter_parts.push(FilterExpr::Eq {
                         column: col_name.clone(),
-                        value: json_value,
+                        value: json_value, cast: None,
                     });
                 }
 
@@ -1529,7 +1533,7 @@ fn build_unique_query(
                 let json_value = value_accessor_to_json(&arg_value);
                 filter_parts.push(FilterExpr::Eq {
                     column: col_name.clone(),
-                    value: json_value,
+                    value: json_value, cast: None,
                 });
             }
 
@@ -1676,7 +1680,7 @@ fn build_list_query(
                 // Convert condition JSON to FilterExpr
                 let filter = condition_json
                     .as_ref()
-                    .and_then(|c| condition_to_filter(c, &table_info.columns));
+                    .and_then(|c| condition_to_filter(c, &table_info.columns, &table_info.schema));
 
                 // Convert orderBy JSON to OrderByExpr
                 let order_by = order_json
@@ -2121,14 +2125,17 @@ fn build_nested_rel_inputs(
             }
 
             let child_type = to_pascal_case(&singularize(&other_table.name));
+            // Mirror the read-side has-many relation naming: pluralize the
+            // singular form so an already-plural table name is not doubled
+            // (e.g. `posts` -> `postsByAuthorId`, not `postsesByAuthorId`)
             let rel_field_name = format!(
                 "{}By{}",
-                to_camel_case(&pluralize(&other_table.name)),
+                pluralize(&to_camel_case(&singularize(&other_table.name))),
                 to_pascal_case(&fk.columns[0]),
             );
             let pascal_rel_field = format!(
                 "{}By{}",
-                to_pascal_case(&pluralize(&other_table.name)),
+                to_pascal_case(&pluralize(&singularize(&other_table.name))),
                 to_pascal_case(&fk.columns[0]),
             );
 
@@ -2191,10 +2198,29 @@ fn register_mutation_types(
             build_nested_rel_inputs(schema_builder, table, type_name, enum_names, all_tables);
         schema_builder = sb;
 
+        // Foreign-key columns covered by a belongs-to nested relationship are
+        // made optional on the create input (the related row may be supplied
+        // via the nested `create`/`connect` field instead of the raw key)
+        let belongs_to_fk_columns: HashSet<String> = nested_rels
+            .iter()
+            .filter_map(|rel| match &rel.direction {
+                mutations::NestedRelDirection::BelongsTo { fk_columns, .. } => {
+                    Some(fk_columns.clone())
+                }
+                mutations::NestedRelDirection::HasMany { .. } => None,
+            })
+            .flatten()
+            .collect();
+
         schema_builder =
             schema_builder.register(mutations::build_on_conflict_input(type_name));
-        schema_builder =
-            schema_builder.register(mutations::build_create_input(table, type_name, enum_names, &nested_fields));
+        schema_builder = schema_builder.register(mutations::build_create_input(
+            table,
+            type_name,
+            enum_names,
+            &nested_fields,
+            &belongs_to_fk_columns,
+        ));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Create{type_name}"),
             table_field_name,
@@ -2515,7 +2541,8 @@ fn build_bulk_update_mutation(
                     .unwrap_or(serde_json::Value::Null);
 
                 // Convert condition to filter expression and compile to SQL
-                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+                let filter_expr =
+                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()
@@ -2606,7 +2633,8 @@ fn build_bulk_delete_mutation(
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+                let filter_expr =
+                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()

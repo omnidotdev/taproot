@@ -162,6 +162,7 @@ pub fn build_create_input(
     type_name: &str,
     enum_names: &HashSet<String>,
     nested_fields: &[NestedRelField],
+    optional_columns: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Create{type_name}Input");
     let on_conflict_type = format!("{type_name}OnConflict");
@@ -178,7 +179,16 @@ pub fn build_create_input(
         }
 
         let field_name = to_camel_case(&col.name);
-        let type_ref = create_input_type_ref(col, enum_names);
+        // A foreign-key column covered by a belongs-to nested relationship is
+        // always optional: the caller may supply the related row via the nested
+        // `create`/`connect` field instead of the raw key, and the resolver
+        // fills the key from it
+        let type_ref = if optional_columns.contains(&col.name) {
+            let (gql_type, _) = resolve_column_type_for_input(col, enum_names);
+            TypeRef::named(gql_type)
+        } else {
+            create_input_type_ref(col, enum_names)
+        };
         input = input.field(InputValue::new(field_name, type_ref));
     }
 
@@ -348,18 +358,7 @@ pub fn create_to_sql(
 
         if let Some(value) = obj.get(&field_name) {
             columns.push(quote_ident(&col.name));
-
-            // Enum columns need explicit casts from text
-            if col.data_type == "USER-DEFINED" {
-                placeholders.push(format!(
-                    "${idx}::{}.{}",
-                    quote_ident(schema),
-                    quote_ident(&col.udt_name),
-                ));
-            } else {
-                placeholders.push(format!("${idx}"));
-            }
-
+            placeholders.push(format!("${idx}{}", col.pg_cast_suffix(schema)));
             params.push(value.clone());
             idx += 1;
         }
@@ -447,17 +446,11 @@ pub fn update_to_sql(
 
         let field_name = to_camel_case(&col.name);
         if let Some(value) = patch_obj.get(&field_name) {
-            // Enum columns need explicit casts from text
-            if col.data_type == "USER-DEFINED" {
-                set_clauses.push(format!(
-                    "{} = ${idx}::{}.{}",
-                    quote_ident(&col.name),
-                    quote_ident(schema),
-                    quote_ident(&col.udt_name),
-                ));
-            } else {
-                set_clauses.push(format!("{} = ${idx}", quote_ident(&col.name)));
-            }
+            set_clauses.push(format!(
+                "{} = ${idx}{}",
+                quote_ident(&col.name),
+                col.pg_cast_suffix(schema),
+            ));
             params.push(value.clone());
             idx += 1;
         }
@@ -605,16 +598,11 @@ pub fn bulk_update_to_sql(
 
         let field_name = to_camel_case(&col.name);
         if let Some(value) = patch_obj.get(&field_name) {
-            if col.data_type == "USER-DEFINED" {
-                set_clauses.push(format!(
-                    "{} = ${idx}::{}.{}",
-                    quote_ident(&col.name),
-                    quote_ident(schema),
-                    quote_ident(&col.udt_name),
-                ));
-            } else {
-                set_clauses.push(format!("{} = ${idx}", quote_ident(&col.name)));
-            }
+            set_clauses.push(format!(
+                "{} = ${idx}{}",
+                quote_ident(&col.name),
+                col.pg_cast_suffix(schema),
+            ));
             params.push(value.clone());
             idx += 1;
         }
