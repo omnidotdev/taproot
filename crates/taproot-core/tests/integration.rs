@@ -517,7 +517,7 @@ async fn filter_query() {
     let gql_schema = build_test_schema(&db, &schema_name).await;
 
     // Filter by name equality
-    let query = r#"{ users(condition: { name: { eq: "Alice" } }) { nodes { name email } totalCount } }"#;
+    let query = r#"{ users(filter: { name: { equalTo: "Alice" } }) { nodes { name email } totalCount } }"#;
     let result = gql_schema.execute(query).await;
 
     teardown_test_schema(&db, &schema_name).await;
@@ -2544,7 +2544,7 @@ async fn bulk_update_mutation() {
     let mutation = r#"
         mutation {
             updateUsers(input: {
-                where: { role: { eq: "viewer" } },
+                where: { role: { equalTo: "viewer" } },
                 patch: { role: editor }
             }) {
                 affectedRows
@@ -2591,7 +2591,7 @@ async fn bulk_delete_mutation() {
     let mutation = r#"
         mutation {
             deleteComments(input: {
-                where: { authorId: { eq: "00000000-0000-0000-0000-000000000002" } }
+                where: { authorId: { equalTo: "00000000-0000-0000-0000-000000000002" } }
             }) {
                 affectedRows
                 comments {
@@ -3670,4 +3670,55 @@ async fn relay_query_nested_root() {
     assert!(result.errors.is_empty(), "nested query errors: {:?}", result.errors);
     let data = result.data.into_json().expect("serialize");
     assert_eq!(data["query"]["users"]["totalCount"], 2);
+}
+
+#[tokio::test]
+async fn condition_flat_equality() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // `condition` is flat equality: { field: value }
+    let query = r#"{ users(condition: { name: "Alice" }) { nodes { name } totalCount } }"#;
+    let result = gql_schema.execute(query).await;
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(result.errors.is_empty(), "condition errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    assert_eq!(data["users"]["totalCount"], 1);
+    assert_eq!(data["users"]["nodes"][0]["name"], "Alice");
+}
+
+#[tokio::test]
+async fn filter_rich_operators_and_combinators() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // `or` combinator over two equality filters
+    let or_query = r#"{ users(filter: { or: [{ name: { equalTo: "Alice" } }, { name: { equalTo: "Bob" } }] }) { totalCount } }"#;
+    let or_result = gql_schema.execute(or_query).await;
+    assert!(or_result.errors.is_empty(), "or errors: {:?}", or_result.errors);
+    assert_eq!(or_result.data.into_json().unwrap()["users"]["totalCount"], 2);
+
+    // case-insensitive substring match
+    let ci_query = r#"{ users(filter: { email: { includesInsensitive: "EXAMPLE" } }) { totalCount } }"#;
+    let ci_result = gql_schema.execute(ci_query).await;
+    assert!(ci_result.errors.is_empty(), "ci errors: {:?}", ci_result.errors);
+    assert_eq!(ci_result.data.into_json().unwrap()["users"]["totalCount"], 2);
+
+    // not combinator excludes Alice
+    let not_query = r#"{ users(filter: { not: { name: { equalTo: "Alice" } } }) { nodes { name } totalCount } }"#;
+    let not_result = gql_schema.execute(not_query).await;
+    teardown_test_schema(&db, &schema_name).await;
+    assert!(not_result.errors.is_empty(), "not errors: {:?}", not_result.errors);
+    let not_data = not_result.data.into_json().unwrap();
+    assert_eq!(not_data["users"]["totalCount"], 1);
+    assert_eq!(not_data["users"]["nodes"][0]["name"], "Bob");
 }

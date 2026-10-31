@@ -538,7 +538,7 @@ pub fn build_bulk_create_input(type_name: &str, plural_type_name: &str) -> Input
 #[must_use]
 pub fn build_bulk_update_input(type_name: &str, plural_type_name: &str) -> InputObject {
     let input_name = format!("Update{plural_type_name}BulkInput");
-    let condition_type = format!("{type_name}Condition");
+    let filter_type = format!("{type_name}Filter");
     let patch_type = format!("Update{type_name}Patch");
     let mut input = InputObject::new(&input_name);
 
@@ -547,7 +547,7 @@ pub fn build_bulk_update_input(type_name: &str, plural_type_name: &str) -> Input
         TypeRef::named(TypeRef::STRING),
     ));
 
-    input = input.field(InputValue::new("where", TypeRef::named_nn(&condition_type)));
+    input = input.field(InputValue::new("where", TypeRef::named_nn(&filter_type)));
 
     input = input.field(InputValue::new("patch", TypeRef::named_nn(&patch_type)));
 
@@ -559,7 +559,7 @@ pub fn build_bulk_update_input(type_name: &str, plural_type_name: &str) -> Input
 #[must_use]
 pub fn build_bulk_delete_input(type_name: &str, plural_type_name: &str) -> InputObject {
     let input_name = format!("Delete{plural_type_name}BulkInput");
-    let condition_type = format!("{type_name}Condition");
+    let filter_type = format!("{type_name}Filter");
     let mut input = InputObject::new(&input_name);
 
     input = input.field(InputValue::new(
@@ -567,7 +567,7 @@ pub fn build_bulk_delete_input(type_name: &str, plural_type_name: &str) -> Input
         TypeRef::named(TypeRef::STRING),
     ));
 
-    input = input.field(InputValue::new("where", TypeRef::named_nn(&condition_type)));
+    input = input.field(InputValue::new("where", TypeRef::named_nn(&filter_type)));
 
     input
 }
