@@ -1,7 +1,7 @@
 //! Mutation input type generation and SQL building for create, update, and
 //! delete operations.
 //!
-//! Follows `PostGraphile` v5 conventions for input and payload types.
+//! Follows standard GraphQL conventions for input and payload types.
 
 use std::collections::HashSet;
 

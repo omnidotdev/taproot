@@ -1,6 +1,6 @@
 //! Condition type generation and SQL conversion for per-table filtering.
 //!
-//! Generates `PostGraphile` v5-compatible `{Type}Condition` input types with
+//! Generates `{Type}Condition` input types with
 //! scalar condition inputs (equality, comparison, pattern matching) and
 //! logical combinators (`and`, `or`, `not`).
 
@@ -151,7 +151,7 @@ pub fn build_table_condition(table: &TableInfo, type_name: &str) -> InputObject 
     let condition_name = format!("{type_name}Condition");
     let mut input = InputObject::new(&condition_name);
 
-    // Flat per-column equality fields (PostGraphile `condition` shape): no
+    // Flat per-column equality fields (flat equality shape): no
     // operators, no combinators. Richer querying goes through `{Type}Filter`
     for col in &table.columns {
         if col.is_array {
@@ -183,8 +183,7 @@ pub fn filter_type_for_scalar(graphql_type: &str) -> Option<String> {
 }
 
 /// Build all `{Scalar}Filter` input types (the rich operator inputs used by the
-/// `filter` argument), using `PostGraphile` `ConnectionFilterPlugin` operator
-/// names.
+/// `filter` argument), using the standard connection-filter operator names.
 #[must_use]
 pub fn build_scalar_filters() -> Vec<InputObject> {
     SCALAR_CONDITIONS.iter().map(build_scalar_filter).collect()
@@ -237,7 +236,7 @@ pub fn list_filter_type_for_scalar(graphql_type: &str) -> Option<String> {
 }
 
 /// Build all `{Scalar}ListFilter` input types (operators on array columns),
-/// using the `PostGraphile` `ConnectionFilterPlugin` `any*` operator names.
+/// using the standard connection-filter `any*` operator names.
 #[must_use]
 pub fn build_scalar_list_filters() -> Vec<InputObject> {
     SCALAR_CONDITIONS
@@ -270,7 +269,7 @@ fn build_scalar_list_filter(def: &ScalarConditionDef) -> InputObject {
 ///
 /// Each scalar column maps to its `{Scalar}Filter` and each array column to its
 /// `{Scalar}ListFilter`, plus `and`, `or`, `not` combinators (the
-/// `PostGraphile` `ConnectionFilterPlugin` shape).
+/// standard connection-filter shape).
 #[must_use]
 pub fn build_table_filter(table: &TableInfo, type_name: &str) -> InputObject {
     let filter_name = format!("{type_name}Filter");

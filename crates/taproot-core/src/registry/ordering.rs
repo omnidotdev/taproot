@@ -1,4 +1,4 @@
-//! `PostGraphile` v5-compatible ordering enum generation and SQL conversion.
+//! ordering enum generation and SQL conversion.
 //!
 //! Each table gets a flat `GraphQL` enum (`{Type}OrderBy`) where every value
 //! encodes both the column and sort direction, e.g. `CREATED_AT_ASC_NULLS_LAST`.

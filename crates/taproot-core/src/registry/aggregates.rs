@@ -1,7 +1,7 @@
 //! Aggregate types and SQL generation for connection-level aggregations.
 //!
 //! Generates `count`, `sum`, `avg`, `min`, `max` aggregate fields on each
-//! connection type, matching `PostGraphile`'s aggregate behavior. Aggregates
+//! connection type, a standard aggregate behavior. Aggregates
 //! apply to the full filtered set, ignoring pagination.
 
 use std::fmt::Write;

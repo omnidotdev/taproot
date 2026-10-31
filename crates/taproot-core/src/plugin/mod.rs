@@ -41,7 +41,7 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Contribute custom root `Query` fields (the Taproot equivalent of
-    /// Postgraphile's `makeExtendSchemaPlugin`).
+    /// a schema-extension hook).
     ///
     /// Returned fields are added to the generated `Query` type. A field's
     /// resolver can run SQL via `ctx.data::<Arc<dyn Database>>()` (the pooled
