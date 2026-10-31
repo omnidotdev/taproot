@@ -23,10 +23,31 @@ impl SmartTags {
     }
 }
 
+/// Parse a single tag body (the text after `@`) into a `(name, value)` pair.
+///
+/// Supports both the space form (`omit create,update`) and the parenthesized
+/// form (`omit(create)`). A bare tag (`omit`) yields an empty value
+fn parse_tag(rest: &str) -> (String, String) {
+    if let Some(open) = rest.find('(') {
+        let name = &rest[..open];
+        let trimmed = rest.trim_end();
+        if !name.contains(' ') && trimmed.ends_with(')') {
+            let value = &rest[open + 1..trimmed.len() - 1];
+            return (name.to_string(), value.trim().to_string());
+        }
+    }
+
+    let mut parts = rest.splitn(2, ' ');
+    let name = parts.next().unwrap_or_default().to_string();
+    let value = parts.next().map(str::trim).unwrap_or_default().to_string();
+    (name, value)
+}
+
 /// Parse a Postgres comment string into smart tags.
 ///
 /// Tags are lines starting with `@`. Everything before the first tag line
-/// is the description. Tag format: `@name` (boolean) or `@name value`.
+/// is the description. Tag format: `@name` (boolean), `@name value`, or
+/// `@name(value)`.
 ///
 /// # Examples
 ///
@@ -49,13 +70,7 @@ pub fn parse_smart_tags(comment: &str) -> SmartTags {
 
         if let Some(rest) = trimmed.strip_prefix('@') {
             in_tags = true;
-            let mut parts = rest.splitn(2, ' ');
-            let tag_name = parts.next().unwrap_or_default().to_string();
-            let tag_value = parts
-                .next()
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string();
+            let (tag_name, tag_value) = parse_tag(rest);
 
             if !tag_name.is_empty() {
                 tags.insert(tag_name, tag_value);
@@ -100,6 +115,15 @@ mod tests {
     fn tag_with_value() {
         let result = parse_smart_tags("@omit create,update,delete");
         assert_eq!(result.get("omit"), Some("create,update,delete"));
+    }
+
+    #[test]
+    fn tag_with_parenthesized_value() {
+        let result = parse_smart_tags("@omit(create)");
+        assert_eq!(result.get("omit"), Some("create"));
+
+        let multi = parse_smart_tags("@omit(create,update)");
+        assert_eq!(multi.get("omit"), Some("create,update"));
     }
 
     #[test]

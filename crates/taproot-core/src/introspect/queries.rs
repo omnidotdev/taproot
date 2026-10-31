@@ -27,13 +27,22 @@ pub async fn introspect(
         let composite_types = fetch_composite_types(db, schema_name).await?;
         let functions = fetch_functions(db, schema_name).await?;
 
-        schemas.push(IntrospectedSchema {
+        let mut introspected = IntrospectedSchema {
             name: schema_name.clone(),
             tables,
             enums,
             composite_types,
             functions,
-        });
+        };
+
+        // Parse `@tag` smart comments into table/column metadata when enabled,
+        // so the option takes effect without the caller having to wire the
+        // SmartCommentsPlugin explicitly
+        if options.smart_comments {
+            crate::plugin::smart_comments::apply_smart_comments(&mut introspected);
+        }
+
+        schemas.push(introspected);
     }
 
     Ok(schemas)
