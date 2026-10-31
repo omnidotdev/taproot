@@ -27,6 +27,85 @@ pub fn decode_cursor(cursor: &str) -> Option<usize> {
     offset_str.parse().ok()
 }
 
+/// A resolved pagination window: how many leading rows to skip and how many to
+/// take, computed from the Relay connection arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    /// Number of leading rows to skip (the window's absolute start offset)
+    pub skip: usize,
+    /// Number of rows to take
+    pub take: usize,
+}
+
+/// The Relay pagination arguments for a connection field. `after`/`before` are
+/// already decoded from cursors into absolute offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageArgs {
+    pub first: Option<usize>,
+    pub after: Option<usize>,
+    pub last: Option<usize>,
+    pub before: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Compute the pagination window from the Relay connection arguments against a
+/// known `total_count`.
+///
+/// Uses the offset-cursor model: `after`/`before` cursors decode to absolute
+/// offsets. `after` sets the lower bound (exclusive), `before` the upper bound
+/// (exclusive), `offset` skips further forward from the lower bound, then
+/// `first` trims from the start of the range and `last` from the end (Relay
+/// applies `first` before `last`). When neither `first` nor `last` is given,
+/// `default_page_size` is applied forward. `first`/`last` are capped at
+/// `max_page_size`.
+#[must_use]
+pub fn compute_window(
+    args: PageArgs,
+    default_page_size: usize,
+    max_page_size: usize,
+    total_count: i64,
+) -> Window {
+    let PageArgs {
+        first,
+        after,
+        last,
+        before,
+        offset,
+    } = args;
+    let total = usize::try_from(total_count).unwrap_or(0);
+
+    let mut lo = after.map_or(0, |a| a.saturating_add(1));
+    let mut hi = before.map_or(total, |b| b.min(total));
+
+    // Additional forward skip, relative to the lower bound
+    lo = lo.saturating_add(offset.unwrap_or(0));
+    lo = lo.min(hi);
+
+    match (first, last) {
+        (Some(f), last_opt) => {
+            let f = f.min(max_page_size);
+            hi = hi.min(lo.saturating_add(f));
+            if let Some(l) = last_opt {
+                let l = l.min(max_page_size);
+                lo = lo.max(hi.saturating_sub(l));
+            }
+        }
+        (None, Some(l)) => {
+            let l = l.min(max_page_size);
+            lo = lo.max(hi.saturating_sub(l));
+        }
+        (None, None) => {
+            let n = default_page_size.min(max_page_size);
+            hi = hi.min(lo.saturating_add(n));
+        }
+    }
+
+    Window {
+        skip: lo,
+        take: hi.saturating_sub(lo),
+    }
+}
+
 /// Build the shared `PageInfo` object type.
 ///
 /// Fields: `hasNextPage`, `hasPreviousPage`, `startCursor`, `endCursor`
@@ -256,6 +335,88 @@ fn extract_list(parent: &async_graphql::Value, key: &str) -> Vec<FieldValue<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn win(
+        first: Option<usize>,
+        after: Option<usize>,
+        last: Option<usize>,
+        before: Option<usize>,
+        offset: Option<usize>,
+        total: i64,
+    ) -> (usize, usize) {
+        let w = compute_window(
+            PageArgs {
+                first,
+                after,
+                last,
+                before,
+                offset,
+            },
+            25,
+            100,
+            total,
+        );
+        (w.skip, w.take)
+    }
+
+    #[test]
+    fn window_default_forward() {
+        assert_eq!(win(None, None, None, None, None, 100), (0, 25));
+    }
+
+    #[test]
+    fn window_first() {
+        assert_eq!(win(Some(10), None, None, None, None, 100), (0, 10));
+    }
+
+    #[test]
+    fn window_after_then_first() {
+        // after cursor at offset 9 -> start at 10
+        assert_eq!(win(Some(10), Some(9), None, None, None, 100), (10, 10));
+    }
+
+    #[test]
+    fn window_last_of_total() {
+        assert_eq!(win(None, None, Some(10), None, None, 100), (90, 10));
+    }
+
+    #[test]
+    fn window_before_then_last() {
+        // before cursor at offset 50 -> upper bound 50, last 10 -> [40, 50)
+        assert_eq!(win(None, None, Some(10), Some(50), None, 100), (40, 10));
+    }
+
+    #[test]
+    fn window_offset_then_first() {
+        assert_eq!(win(Some(10), None, None, None, Some(5), 100), (5, 10));
+    }
+
+    #[test]
+    fn window_first_capped_at_max() {
+        // first 1000 capped at max_page_size 100
+        assert_eq!(win(Some(1000), None, None, None, None, 500), (0, 100));
+    }
+
+    #[test]
+    fn window_last_exceeds_total() {
+        assert_eq!(win(None, None, Some(10), None, None, 3), (0, 3));
+    }
+
+    #[test]
+    fn window_after_past_end() {
+        assert_eq!(win(Some(10), Some(500), None, None, None, 100), (100, 0));
+    }
+
+    #[test]
+    fn window_first_zero() {
+        assert_eq!(win(Some(0), None, None, None, None, 100), (0, 0));
+    }
+
+    #[test]
+    fn window_first_then_last_combined() {
+        // first 20 -> [0,20); last 5 -> [15,20)
+        assert_eq!(win(Some(20), None, Some(5), None, None, 100), (15, 5));
+    }
 
     #[test]
     fn cursor_roundtrip() {

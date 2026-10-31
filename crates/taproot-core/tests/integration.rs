@@ -393,6 +393,55 @@ async fn execute_singular_query_by_id() {
 }
 
 #[tokio::test]
+async fn connection_backward_pagination() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // last: 1 over [Alice, Bob] ordered by id asc -> Bob, with a previous page
+    let result = gql_schema
+        .execute("{ users(orderBy: [ID_ASC], last: 1) { nodes { name } totalCount pageInfo { hasNextPage hasPreviousPage } } }")
+        .await;
+    assert!(result.errors.is_empty(), "last-page errors: {:?}", result.errors);
+
+    let data = result.data.into_json().expect("serialize");
+    let conn = &data["users"];
+    assert_eq!(conn["totalCount"], 2);
+    let nodes = conn["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 1, "expected 1 node");
+    assert_eq!(nodes[0]["name"], "Bob");
+    assert_eq!(conn["pageInfo"]["hasPreviousPage"], true);
+    assert_eq!(conn["pageInfo"]["hasNextPage"], false);
+
+    // Grab Bob's cursor, then page backward with before + last
+    let edges_result = gql_schema
+        .execute("{ users(orderBy: [ID_ASC], first: 2) { edges { cursor node { name } } } }")
+        .await;
+    let edges_data = edges_result.data.into_json().expect("serialize");
+    let edges = edges_data["users"]["edges"].as_array().expect("edges");
+    assert_eq!(edges[1]["node"]["name"], "Bob");
+    let bob_cursor = edges[1]["cursor"].as_str().expect("cursor").to_owned();
+
+    let before_query = format!(
+        r#"{{ users(orderBy: [ID_ASC], last: 1, before: "{bob_cursor}") {{ nodes {{ name }} }} }}"#
+    );
+    let before_result = gql_schema.execute(&before_query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(before_result.errors.is_empty(), "before errors: {:?}", before_result.errors);
+    let before_data = before_result.data.into_json().expect("serialize");
+    let before_nodes = before_data["users"]["nodes"].as_array().expect("nodes");
+    assert_eq!(before_nodes.len(), 1, "expected 1 node before Bob");
+    assert_eq!(before_nodes[0]["name"], "Alice");
+}
+
+#[tokio::test]
 async fn connection_query_with_pagination() {
     let Some(db) = connect().await else {
         return;
