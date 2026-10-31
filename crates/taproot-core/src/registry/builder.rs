@@ -393,6 +393,20 @@ pub fn build_schema(
         }
     }
 
+    // Relay-classic nested `query` root: `query: Query!` returns the Query type
+    // itself, so clients can re-enter the root from any point in a document
+    query = query.field(Field::new(
+        "query",
+        TypeRef::named_nn("Query"),
+        |_ctx| {
+            FieldFuture::new(async {
+                Ok(Some(FieldValue::value(async_graphql::Value::Object(
+                    async_graphql::indexmap::IndexMap::default(),
+                ))))
+            })
+        },
+    ));
+
     schema_builder = schema_builder.register(query);
 
     let mut has_plugin_mutations = false;
