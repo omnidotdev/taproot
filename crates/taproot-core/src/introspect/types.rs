@@ -72,6 +72,60 @@ impl ColumnInfo {
         }
         String::new()
     }
+
+    /// GraphQL field name for this column (see [`column_field_name`])
+    #[must_use]
+    pub fn field_name(&self) -> String {
+        column_field_name(&self.name)
+    }
+}
+
+/// `camelCase` a `snake_case` identifier
+fn camel_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for (i, c) in s.chars().enumerate() {
+        if c == '_' {
+            upper_next = true;
+        } else if i == 0 {
+            out.extend(c.to_lowercase());
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// GraphQL field name for a database column.
+///
+/// A column literally named `id` is exposed as `rowId` (matching
+/// `PgSimplifyInflection`, which reserves `id` for a global identifier); every
+/// other column is camelCased
+#[must_use]
+pub fn column_field_name(column: &str) -> String {
+    if column == "id" {
+        "rowId".to_string()
+    } else {
+        camel_case(column)
+    }
+}
+
+/// `SCREAMING_SNAKE_CASE` form of a column's GraphQL field name, used for
+/// order-by enum values (`id` -> `ROW_ID`, `created_at` -> `CREATED_AT`).
+#[must_use]
+pub fn column_order_token(column: &str) -> String {
+    let field = column_field_name(column);
+    let mut out = String::with_capacity(field.len() + 4);
+    for c in field.chars() {
+        if c.is_ascii_uppercase() && !out.is_empty() {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
 }
 
 /// Primary key constraint for a table.

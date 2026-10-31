@@ -10,7 +10,6 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, Object, TypeRef};
 
 use crate::introspect::ColumnInfo;
 
-use super::builder::to_camel_case;
 use super::scalars::map_udt_to_graphql;
 
 /// UDT names considered numeric (eligible for sum/avg)
@@ -134,7 +133,7 @@ pub fn build_sum_type(type_name: &str, columns: &[ColumnInfo]) -> Option<Object>
     let mut obj = Object::new(&obj_name);
 
     for col in &fields {
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         obj = obj.field(build_scalar_extract_field(&field_name, TypeRef::FLOAT));
     }
 
@@ -157,7 +156,7 @@ pub fn build_avg_type(type_name: &str, columns: &[ColumnInfo]) -> Option<Object>
     let mut obj = Object::new(&obj_name);
 
     for col in &fields {
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         obj = obj.field(build_scalar_extract_field(&field_name, TypeRef::FLOAT));
     }
 
@@ -191,7 +190,7 @@ fn build_minmax_type(type_name: &str, suffix: &str, columns: &[ColumnInfo]) -> O
     let mut obj = Object::new(&obj_name);
 
     for col in &fields {
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         let (gql_type, _) = map_udt_to_graphql(&col.udt_name);
         obj = obj.field(build_scalar_extract_field(&field_name, gql_type));
     }
@@ -224,7 +223,7 @@ pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) ->
             if i > 0 {
                 let _ = write!(sql, ", ");
             }
-            let field_name = to_camel_case(&col.name);
+            let field_name = crate::introspect::column_field_name(&col.name);
             let _ = write!(
                 sql,
                 "'{field_name}', SUM({col})",
@@ -239,7 +238,7 @@ pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) ->
             if i > 0 {
                 let _ = write!(sql, ", ");
             }
-            let field_name = to_camel_case(&col.name);
+            let field_name = crate::introspect::column_field_name(&col.name);
             let _ = write!(
                 sql,
                 "'{field_name}', AVG({col})",
@@ -256,7 +255,7 @@ pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) ->
             if i > 0 {
                 let _ = write!(sql, ", ");
             }
-            let field_name = to_camel_case(&col.name);
+            let field_name = crate::introspect::column_field_name(&col.name);
             let _ = write!(
                 sql,
                 "'{field_name}', MIN({col})",
@@ -271,7 +270,7 @@ pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) ->
             if i > 0 {
                 let _ = write!(sql, ", ");
             }
-            let field_name = to_camel_case(&col.name);
+            let field_name = crate::introspect::column_field_name(&col.name);
             let _ = write!(
                 sql,
                 "'{field_name}', MAX({col})",

@@ -153,7 +153,10 @@ pub fn condition_to_filter(
             }
             column_name => {
                 // Skip unknown columns
-                if let Some(col) = columns.iter().find(|c| c.name == column_name) {
+                if let Some(col) = columns
+                    .iter()
+                    .find(|c| crate::introspect::column_field_name(&c.name) == column_name)
+                {
                     filters.extend(parse_column_ops(col, val, schema));
                 }
             }
@@ -197,13 +200,12 @@ pub fn order_to_exprs(order_by: &Value, columns: &[ColumnInfo]) -> Vec<OrderByEx
                     s.strip_suffix(suffix).map(|col| (col, *dir))
                 })?;
 
-            let column = col_part.to_lowercase();
-
-            // Skip unknown columns
-            let is_known = columns.iter().any(|c| c.name == column);
-            if !is_known {
-                return None;
-            }
+            // Match the enum's column token against each column's order token
+            // (e.g. ROW_ID -> the `id` column), skipping unknown columns
+            let column = columns
+                .iter()
+                .find(|c| crate::introspect::column_order_token(&c.name) == col_part)
+                .map(|c| c.name.clone())?;
 
             Some(OrderByExpr { column, direction })
         })

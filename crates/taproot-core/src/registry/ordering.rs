@@ -28,7 +28,7 @@ pub fn build_table_order_by(table: &TableInfo, type_name: &str) -> Enum {
     let mut gql_enum = Enum::new(&enum_name);
 
     for col in &table.columns {
-        let col_upper = col.name.to_uppercase();
+        let col_upper = crate::introspect::column_order_token(&col.name);
 
         for (suffix, _sql) in ORDER_SUFFIXES {
             let value = format!("{col_upper}{suffix}");

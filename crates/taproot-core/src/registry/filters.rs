@@ -161,7 +161,7 @@ pub fn build_table_condition(table: &TableInfo, type_name: &str) -> InputObject 
         let (gql_type, _) = map_udt_to_graphql(&col.udt_name);
 
         if let Some(cond_type) = condition_type_for_scalar(gql_type) {
-            input = input.field(InputValue::new(&col.name, TypeRef::named(cond_type)));
+            input = input.field(InputValue::new(crate::introspect::column_field_name(&col.name), TypeRef::named(cond_type)));
         }
     }
 

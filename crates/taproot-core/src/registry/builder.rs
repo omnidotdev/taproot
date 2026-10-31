@@ -204,7 +204,7 @@ pub fn build_schema(
                 let pk_cols: Vec<(String, String)> = pk
                     .columns
                     .iter()
-                    .map(|c| (to_camel_case(c), c.clone()))
+                    .map(|c| (crate::introspect::column_field_name(c), c.clone()))
                     .collect();
                 entity_map.register(
                     &type_name,
@@ -641,7 +641,7 @@ fn build_object_type(
 
     // Column fields
     for col in &table.columns {
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         let type_ref = column_to_type_ref(col, enum_names);
 
         let col_name = col.name.clone();
@@ -935,7 +935,7 @@ fn build_object_type(
     if options.federation
         && let Some(pk) = &table.primary_key
     {
-        let key_fields: Vec<String> = pk.columns.iter().map(|c| to_camel_case(c)).collect();
+        let key_fields: Vec<String> = pk.columns.iter().map(|c| crate::introspect::column_field_name(c)).collect();
         object = object.key(key_fields.join(" "));
     }
 
@@ -1004,8 +1004,8 @@ fn build_computed_field(
             let mut where_parts = Vec::new();
             let mut params: Vec<serde_json::Value> = Vec::new();
             for (i, col) in pk_cols.iter().enumerate() {
-                let camel = to_camel_case(col);
-                let Some(pk_val) = map.get(camel.as_str()) else {
+                // The parent row is keyed by raw column names, not GraphQL names
+                let Some(pk_val) = map.get(col.as_str()) else {
                     return Ok(None);
                 };
                 if *pk_val == async_graphql::Value::Null {
@@ -1215,7 +1215,7 @@ fn build_custom_function_query(
                             if let serde_json::Value::Object(map) = unwrapped {
                                 let remapped: serde_json::Map<String, serde_json::Value> = map
                                     .into_iter()
-                                    .map(|(k, v)| (to_camel_case(&k), v))
+                                    .map(|(k, v)| (crate::introspect::column_field_name(&k), v))
                                     .collect();
                                 serde_json::Value::Object(remapped)
                             } else {
@@ -1427,7 +1427,7 @@ fn build_singular_query(
         .iter()
         .map(|col| {
             let (gql_type, _) = resolve_column_type(col, enum_names);
-            (to_camel_case(&col.name), col.name.clone(), gql_type)
+            (crate::introspect::column_field_name(&col.name), col.name.clone(), gql_type)
         })
         .collect();
 
@@ -1530,7 +1530,7 @@ fn build_unique_query(
     let schema_name = table.schema.clone();
     let table_name = table.name.clone();
     let constraint_columns: Vec<String> = constraint.columns.clone();
-    let arg_names: Vec<String> = constraint.columns.iter().map(|c| to_camel_case(c)).collect();
+    let arg_names: Vec<String> = constraint.columns.iter().map(|c| crate::introspect::column_field_name(c)).collect();
     let db = Arc::clone(db);
 
     let mut field = Field::new(field_name, TypeRef::named(type_name), move |ctx| {
@@ -1583,7 +1583,7 @@ fn build_unique_query(
 
     // Add each unique constraint column as a required argument
     for (col, gql_type) in &col_infos {
-        let arg_name = to_camel_case(&col.name);
+        let arg_name = crate::introspect::column_field_name(&col.name);
         field = field.argument(InputValue::new(arg_name, TypeRef::named_nn(gql_type.as_str())));
     }
 
@@ -2775,7 +2775,7 @@ fn build_create_mutation(
                                     })?;
 
                                     for (fk_col, pk_col) in fk_columns.iter().zip(related_pk_columns.iter()) {
-                                        let pk_field = to_camel_case(pk_col);
+                                        let pk_field = crate::introspect::column_field_name(pk_col);
                                         let pk_value = connect_obj.get(&pk_field).cloned().ok_or_else(|| {
                                             async_graphql::Error::new(format!(
                                                 "connect input missing required field `{pk_field}`"
@@ -2799,7 +2799,7 @@ fn build_create_mutation(
                                             )));
                                         }
 
-                                        let fk_field = to_camel_case(fk_col);
+                                        let fk_field = crate::introspect::column_field_name(fk_col);
                                         input_obj.insert(fk_field, pk_value);
                                     }
                                 } else if let Some(create_val) = nested_obj.get("create") {
@@ -2830,7 +2830,7 @@ fn build_create_mutation(
                                                 "nested create result missing PK column `{pk_col}`"
                                             ))
                                         })?;
-                                        let fk_field = to_camel_case(fk_col);
+                                        let fk_field = crate::introspect::column_field_name(fk_col);
                                         input_obj.insert(fk_field, pk_value);
                                     }
                                 }
@@ -2901,7 +2901,7 @@ fn build_create_mutation(
                                                 "parent row missing PK column `{parent_pk}`"
                                             ))
                                         })?;
-                                        let fk_field = to_camel_case(child_fk);
+                                        let fk_field = crate::introspect::column_field_name(child_fk);
                                         child_obj.insert(fk_field, pk_value);
                                     }
 
@@ -2972,7 +2972,7 @@ fn build_update_mutation(
     // Store (camelCase field name, snake_case column name) pairs
     let pk_mappings: Vec<(String, String)> = pk_cols
         .iter()
-        .map(|c| (to_camel_case(&c.name), c.name.clone()))
+        .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
         .collect();
     let db = Arc::clone(db);
 
@@ -3061,7 +3061,7 @@ fn build_delete_mutation(
     let table_field = table_field_name.to_string();
     let pk_mappings: Vec<(String, String)> = pk_cols
         .iter()
-        .map(|c| (to_camel_case(&c.name), c.name.clone()))
+        .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
         .collect();
     let db = Arc::clone(db);
 
