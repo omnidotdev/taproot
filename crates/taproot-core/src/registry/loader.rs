@@ -166,4 +166,59 @@ mod tests {
     fn normalize_key_handles_null() {
         assert_eq!(normalize_key(&serde_json::Value::Null), "null");
     }
+
+    #[tokio::test]
+    async fn belongs_to_loader_batches_into_single_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+
+        use crate::db::JsonRow;
+        use crate::error::Result as DbResult;
+
+        // Database double that counts how many queries it runs
+        struct CountingBackend {
+            count: Arc<AtomicUsize>,
+            rows: Vec<JsonRow>,
+        }
+
+        #[async_trait]
+        impl Database for CountingBackend {
+            async fn query(&self, _sql: &str, _params: &[serde_json::Value]) -> DbResult<Vec<JsonRow>> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(self.rows.clone())
+            }
+            async fn execute(&self, _sql: &str, _params: &[serde_json::Value]) -> DbResult<u64> {
+                Ok(0)
+            }
+            async fn query_raw(&self, _sql: &str) -> DbResult<Vec<JsonRow>> {
+                Ok(vec![])
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let rows = vec![
+            serde_json::json!({ "id": "k1", "name": "A" }),
+            serde_json::json!({ "id": "k2", "name": "B" }),
+            serde_json::json!({ "id": "k3", "name": "C" }),
+        ];
+        let db: Arc<dyn Database> = Arc::new(CountingBackend {
+            count: Arc::clone(&count),
+            rows,
+        });
+
+        let loader =
+            BelongsToLoader::new(db, "public".into(), "users".into(), "id".into(), None);
+
+        let keys = vec!["k1".to_string(), "k2".to_string(), "k3".to_string()];
+        let result = loader.load(&keys).await.expect("load");
+
+        // Three keys are resolved in a SINGLE batched query, not N+1
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "belongs-to loader must batch all keys into one query"
+        );
+        assert_eq!(result.len(), 3);
+    }
 }
