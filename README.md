@@ -1,12 +1,31 @@
-# Taproot
+<div align="center">
+  <img src="/assets/logo.png" width="100" />
 
-Auto-generate a GraphQL API from a PostgreSQL database. Point Taproot at your database, and it introspects your schema to produce a fully-featured GraphQL endpoint — queries with filtering, sorting, and Relay-style pagination; create/update/delete mutations; and real-time subscriptions via Postgres NOTIFY.
+  <h1 align="center">Taproot</h1>
 
-## Quick start
+[Website](https://taproot.omni.dev) | [Docs](https://docs.omni.dev/products/taproot) | [Feedback](https://backfeed.omni.dev/workspaces/omni/projects/taproot) | [Discord](https://discord.gg/omnidotdev) | [X](https://x.com/omnidotdev) | [Threads](https://www.threads.com/@omnidotdev)
+
+</div>
+
+**Taproot** is a pure Rust library and server that auto-generates a full GraphQL API from a PostgreSQL database. Point it at your database and it introspects tables, columns, relationships, and enums at startup to serve a dynamic, queryable schema with zero codegen.
+
+## Installation
+
+| Platform | Channel | Command / Link |
+| --- | --- | --- |
+| All | [GitHub Releases](https://github.com/omnidotdev/taproot/releases) | Download the `taproot` server binary |
+| All | [crates.io](https://crates.io/crates/taproot-server) | `cargo install taproot-server` |
+| Library | [crates.io](https://crates.io/crates/taproot-core) | `taproot-core = "0.1"` in `Cargo.toml` |
+
+### Build from source
 
 ```bash
-cargo install --path crates/taproot-server
+git clone https://github.com/omnidotdev/taproot
+cd taproot
+cargo build --release          # binary at target/release/taproot
 ```
+
+## Quick Start
 
 Create a `taproot.yaml`:
 
@@ -18,85 +37,48 @@ server:
   playground: true
 ```
 
-Run the server:
+Run the server and open `http://localhost:4000/graphql` to explore the API in GraphiQL:
 
 ```bash
 taproot -c taproot.yaml
 ```
 
-Open `http://localhost:4000/graphql` in a browser to explore your API with GraphiQL.
-
 ## Features
 
-- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types. A column named `id` is exposed as `rowId` (a common convention)
-- **Relay pagination** — cursor-based connections with `first`/`after`/`last`/`before`/`offset`
-- **Filtering** — a flat `condition` for per-column equality, plus a rich `filter` with `equalTo`, `notEqualTo`, `in`, `notIn`, `lessThan`, `lessThanOrEqualTo`, `greaterThan`, `greaterThanOrEqualTo`, `isNull`, string operators (`includes`, `includesInsensitive`, `startsWith`, `endsWith`, `like`, `likeInsensitive`, ...), array-column membership (`anyEqualTo`, `anyGreaterThan`, ...), and `and`/`or`/`not` combinators
-- **Mutations** — auto-generated `create`, `update`, `delete` operations, bulk variants, and nested `create`/`connect` for related records, for tables with single-column primary keys
-- **Subscriptions** — real-time change notifications via Postgres `LISTEN`/`NOTIFY`
+- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types (a column named `id` is exposed as `rowId`)
+- **Relay pagination** — cursor connections with `first`/`after`/`last`/`before`/`offset`
+- **Filtering** — a flat `condition` (equality) plus a rich `filter` with comparison, pattern, and array operators and `and`/`or`/`not`
+- **Mutations** — `create`/`update`/`delete`, bulk variants, and nested `create`/`connect` for related records
+- **Subscriptions** — real-time change notifications over Postgres `LISTEN`/`NOTIFY`
 - **Row-Level Security** — JWT-based auth with RLS passthrough to Postgres
 - **Apollo Federation** — expose tables as federated subgraph entities
-- **Lattice integration** — embed as a subgraph executor in the Lattice gateway
-- **Plugin system** — `on_introspect`, `on_plan`, and `filter_table` hooks, plus `query_fields`/`mutation_fields` to contribute custom root fields backed by SQL
-- **Smart comments** — `@omit`, `@name`, `@deprecated` table/column annotations
-- **Query limits** — configurable depth and complexity limits to prevent abuse
+- **Plugin system** — `on_introspect`, `on_plan`, `filter_table`, plus `query_fields`/`mutation_fields` for custom SQL-backed root fields
+- **Smart comments** — `@omit`, `@name`, `@deprecated` annotations
 - **Embeddable** — use as a Rust library via `taproot-core`
 
-## Configuration
-
-See the [full configuration reference](https://docs.omni.dev/products/taproot/configuration) or the example below:
-
-```yaml
-database:
-  url: "postgres://localhost:5432/mydb"
-  pool_size: 20
-  schemas: ["public"]
-  exclude_tables: ["migrations"]
-
-server:
-  listen: "0.0.0.0:4000"
-  graphql_path: "/graphql"
-  playground: true
-
-schema:
-  relay_pagination: true
-  default_page_size: 25
-  max_page_size: 100
-  federation: false
-  subscriptions: false
-  max_depth: 15
-  max_complexity: 1000
-
-auth:
-  rls: false
-  role_claim: "pg_role"
-  default_role: "anonymous"
-  jwt_secret: null
-
-subscriptions:
-  enabled: false
-  notify_channel: "graphql_subscriptions"
-```
+See the [configuration reference](https://docs.omni.dev/products/taproot) for all options.
 
 ## Development
 
-Requires a nightly Rust toolchain (pinned in `rust-toolchain.toml`) and, for the integration tests, a reachable PostgreSQL instance.
+### Prerequisites
+
+- [Rust](https://rustup.rs) nightly (pinned in `rust-toolchain.toml`)
+- A PostgreSQL instance for the integration tests
+
+### Commands
 
 ```bash
-# Unit + integration suite (integration tests need a database; they create and
-# drop their own schemas, so point this at a throwaway DB — when unset they skip)
+# integration tests create and drop their own schemas; point this at a
+# throwaway database (tests are skipped when it is unset)
 export DATABASE_URL="postgres://postgres:postgres@localhost:5432/taproot_test"
-cargo test
-
-# Lint
-cargo clippy --all-targets
-
-# Build the server binary
+cargo test                     # unit + integration suite
+cargo clippy --all-targets     # lint
 cargo build --release -p taproot-server
 ```
 
 ## Documentation
 
-Full documentation is available at [docs.omni.dev/products/taproot](https://docs.omni.dev/products/taproot).
+Full documentation is at [docs.omni.dev/products/taproot](https://docs.omni.dev/products/taproot).
 
 ## License
 
