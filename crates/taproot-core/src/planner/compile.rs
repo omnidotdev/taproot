@@ -74,6 +74,12 @@ pub fn compile_filter(expr: &FilterExpr, param_offset: usize) -> (String, Vec<Va
             (sql, vec![])
         }
 
+        FilterExpr::ArrayAny { column, op, value, cast } => {
+            let cast = cast.as_deref().unwrap_or_default();
+            let sql = format!("${param_offset}{cast} {op} ANY({})", quote_ident(column));
+            (sql, vec![value.clone()])
+        }
+
         FilterExpr::And(children) => compile_compound(children, "AND", param_offset),
         FilterExpr::Or(children) => compile_compound(children, "OR", param_offset),
 

@@ -30,7 +30,7 @@ Open `http://localhost:4000/graphql` in a browser to explore your API with Graph
 
 - **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types. A column named `id` is exposed as `rowId` (matching `PgSimplifyInflection`)
 - **Relay pagination** — cursor-based connections with `first`/`after`/`last`/`before`/`offset`
-- **Filtering** — a flat `condition` for per-column equality, plus a rich `filter` with `equalTo`, `notEqualTo`, `in`, `notIn`, `lessThan`, `lessThanOrEqualTo`, `greaterThan`, `greaterThanOrEqualTo`, `isNull`, string operators (`includes`, `includesInsensitive`, `startsWith`, `endsWith`, `like`, `likeInsensitive`, ...), and `and`/`or`/`not` combinators
+- **Filtering** — a flat `condition` for per-column equality, plus a rich `filter` with `equalTo`, `notEqualTo`, `in`, `notIn`, `lessThan`, `lessThanOrEqualTo`, `greaterThan`, `greaterThanOrEqualTo`, `isNull`, string operators (`includes`, `includesInsensitive`, `startsWith`, `endsWith`, `like`, `likeInsensitive`, ...), array-column membership (`anyEqualTo`, `anyGreaterThan`, ...), and `and`/`or`/`not` combinators
 - **Mutations** — auto-generated `create`, `update`, `delete` operations, bulk variants, and nested `create`/`connect` for related records, for tables with single-column primary keys
 - **Subscriptions** — real-time change notifications via Postgres `LISTEN`/`NOTIFY`
 - **Row-Level Security** — JWT-based auth with RLS passthrough to Postgres

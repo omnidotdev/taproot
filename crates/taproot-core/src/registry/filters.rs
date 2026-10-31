@@ -223,22 +223,68 @@ fn build_scalar_filter(def: &ScalarConditionDef) -> InputObject {
     input
 }
 
+/// `{Scalar}ListFilter` type name for a scalar condition definition
+/// (`StringCondition` -> `StringListFilter`).
+fn list_filter_type_name(condition_type_name: &str) -> String {
+    condition_type_name.replace("Condition", "ListFilter")
+}
+
+/// Look up the `{Scalar}ListFilter` type name for an array column's element
+/// GraphQL scalar.
+#[must_use]
+pub fn list_filter_type_for_scalar(graphql_type: &str) -> Option<String> {
+    condition_type_for_scalar(graphql_type).map(list_filter_type_name)
+}
+
+/// Build all `{Scalar}ListFilter` input types (operators on array columns),
+/// using the `PostGraphile` `ConnectionFilterPlugin` `any*` operator names.
+#[must_use]
+pub fn build_scalar_list_filters() -> Vec<InputObject> {
+    SCALAR_CONDITIONS
+        .iter()
+        .map(build_scalar_list_filter)
+        .collect()
+}
+
+/// Build a single `{Scalar}ListFilter`. The `any*` operators take a single
+/// element value and match if any array element satisfies the comparison
+fn build_scalar_list_filter(def: &ScalarConditionDef) -> InputObject {
+    let scalar = def.scalar;
+    let mut input = InputObject::new(list_filter_type_name(def.type_name))
+        .field(InputValue::new("isNull", TypeRef::named("Boolean")))
+        .field(InputValue::new("anyEqualTo", TypeRef::named(scalar)))
+        .field(InputValue::new("anyNotEqualTo", TypeRef::named(scalar)));
+
+    if def.has_ordering {
+        input = input
+            .field(InputValue::new("anyLessThan", TypeRef::named(scalar)))
+            .field(InputValue::new("anyLessThanOrEqualTo", TypeRef::named(scalar)))
+            .field(InputValue::new("anyGreaterThan", TypeRef::named(scalar)))
+            .field(InputValue::new("anyGreaterThanOrEqualTo", TypeRef::named(scalar)));
+    }
+
+    input
+}
+
 /// Build a per-table `{Type}Filter` input type.
 ///
-/// Each column maps to its `{Scalar}Filter`, plus `and`, `or`, `not`
-/// combinators (the `PostGraphile` `ConnectionFilterPlugin` shape).
+/// Each scalar column maps to its `{Scalar}Filter` and each array column to its
+/// `{Scalar}ListFilter`, plus `and`, `or`, `not` combinators (the
+/// `PostGraphile` `ConnectionFilterPlugin` shape).
 #[must_use]
 pub fn build_table_filter(table: &TableInfo, type_name: &str) -> InputObject {
     let filter_name = format!("{type_name}Filter");
     let mut input = InputObject::new(&filter_name);
 
     for col in &table.columns {
-        if col.is_array {
-            continue;
-        }
-
+        // `map_udt_to_graphql` returns the element scalar for array columns
         let (gql_type, _) = map_udt_to_graphql(&col.udt_name);
-        if let Some(filter_type) = filter_type_for_scalar(gql_type) {
+        let field_type = if col.is_array {
+            list_filter_type_for_scalar(gql_type)
+        } else {
+            filter_type_for_scalar(gql_type)
+        };
+        if let Some(filter_type) = field_type {
             input = input.field(InputValue::new(
                 crate::introspect::column_field_name(&col.name),
                 TypeRef::named(&filter_type),
