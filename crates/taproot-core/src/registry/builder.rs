@@ -134,6 +134,9 @@ pub fn build_schema(
     };
     let mut schema_builder = Schema::build("Query", Some("Mutation"), subscription_type);
     schema_builder = schema_builder.data(plugin_store);
+    // Expose the pooled database handle so plugin-contributed field resolvers
+    // can run SQL (alongside the per-request RlsContext added by the server)
+    schema_builder = schema_builder.data(Arc::clone(db));
 
     let loader_registry = LoaderRegistry::new(Arc::clone(db), None);
     schema_builder = schema_builder.data(loader_registry);
@@ -382,9 +385,25 @@ pub fn build_schema(
         }
     }
 
+    // Custom root fields contributed by plugins (Postgraphile
+    // makeExtendSchemaPlugin parity)
+    for plugin in plugins {
+        for field in plugin.query_fields(&schemas) {
+            query = query.field(field);
+        }
+    }
+
     schema_builder = schema_builder.register(query);
 
-    if !has_mutations {
+    let mut has_plugin_mutations = false;
+    for plugin in plugins {
+        for field in plugin.mutation_fields(&schemas) {
+            mutation = mutation.field(field);
+            has_plugin_mutations = true;
+        }
+    }
+
+    if !has_mutations && !has_plugin_mutations {
         // Schema requires at least one field on the mutation type
         mutation = mutation.field(Field::new(
             "_empty",
