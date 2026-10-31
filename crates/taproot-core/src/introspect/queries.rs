@@ -375,7 +375,9 @@ async fn fetch_functions(db: &dyn Database, schema: &str) -> Result<Vec<Function
             n.nspname AS schema,
             pg_catalog.format_type(p.prorettype, NULL) AS return_type,
             p.proretset AS returns_set,
-            p.provolatile AS volatility,
+            -- provolatile is Postgres's internal \"char\" type, which the row decoder
+            -- cannot read as a String, so cast to text (it is consumed as its first char)
+            p.provolatile::text AS volatility,
             pg_catalog.pg_get_function_arguments(p.oid) AS arg_string,
             COALESCE(
                 (SELECT c.relname FROM pg_catalog.pg_class c
