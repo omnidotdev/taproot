@@ -9,7 +9,7 @@ use async_graphql::dynamic::{InputObject, InputValue, TypeRef};
 
 use crate::introspect::{ColumnInfo, TableInfo};
 
-use super::builder::{to_camel_case, to_pascal_case};
+use super::builder::to_pascal_case;
 use super::scalars::map_udt_to_graphql;
 
 /// Descriptor for a nested relationship field on a create input type.
@@ -100,7 +100,7 @@ pub fn build_nested_connect_input(
     let mut input = InputObject::new(connect_input_name);
 
     for pk_col in pk_cols {
-        let field_name = to_camel_case(&pk_col.name);
+        let field_name = crate::introspect::column_field_name(&pk_col.name);
         let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
         input = input.field(InputValue::new(field_name, TypeRef::named_nn(gql_type)));
     }
@@ -178,7 +178,7 @@ pub fn build_create_input(
             continue;
         }
 
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         // A foreign-key column covered by a belongs-to nested relationship is
         // always optional: the caller may supply the related row via the nested
         // `create`/`connect` field instead of the raw key, and the resolver
@@ -228,7 +228,7 @@ pub fn build_update_input(
 
     // All PK fields are required
     for pk_col in pk_cols {
-        let pk_field_name = to_camel_case(&pk_col.name);
+        let pk_field_name = crate::introspect::column_field_name(&pk_col.name);
         let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
         input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
     }
@@ -258,7 +258,7 @@ pub fn build_update_patch(
             continue;
         }
 
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         let (gql_type, _) = resolve_column_type_for_input(col, enum_names);
         // All patch fields are optional
         patch = patch.field(InputValue::new(field_name, TypeRef::named(gql_type)));
@@ -285,7 +285,7 @@ pub fn build_delete_input(
     ));
 
     for pk_col in pk_cols {
-        let pk_field_name = to_camel_case(&pk_col.name);
+        let pk_field_name = crate::introspect::column_field_name(&pk_col.name);
         let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
         input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
     }
@@ -349,7 +349,7 @@ pub fn create_to_sql(
             continue;
         }
 
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
 
         // Skip meta fields
         if field_name == "clientMutationId" || field_name == "onConflict" {
@@ -444,7 +444,7 @@ pub fn update_to_sql(
             continue;
         }
 
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         if let Some(value) = patch_obj.get(&field_name) {
             set_clauses.push(format!(
                 "{} = ${idx}{}",
@@ -596,7 +596,7 @@ pub fn bulk_update_to_sql(
             continue;
         }
 
-        let field_name = to_camel_case(&col.name);
+        let field_name = crate::introspect::column_field_name(&col.name);
         if let Some(value) = patch_obj.get(&field_name) {
             set_clauses.push(format!(
                 "{} = ${idx}{}",

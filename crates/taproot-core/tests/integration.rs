@@ -372,7 +372,7 @@ async fn execute_singular_query_by_id() {
 
     let gql_schema = build_test_schema(&db, &schema_name).await;
 
-    let query = r#"{ user(id: "00000000-0000-0000-0000-000000000001") { name } }"#;
+    let query = r#"{ user(rowId: "00000000-0000-0000-0000-000000000001") { name } }"#;
     let result = gql_schema.execute(query).await;
 
     teardown_test_schema(&db, &schema_name).await;
@@ -405,7 +405,7 @@ async fn connection_backward_pagination() {
 
     // last: 1 over [Alice, Bob] ordered by id asc -> Bob, with a previous page
     let result = gql_schema
-        .execute("{ users(orderBy: [ID_ASC], last: 1) { nodes { name } totalCount pageInfo { hasNextPage hasPreviousPage } } }")
+        .execute("{ users(orderBy: [ROW_ID_ASC], last: 1) { nodes { name } totalCount pageInfo { hasNextPage hasPreviousPage } } }")
         .await;
     assert!(result.errors.is_empty(), "last-page errors: {:?}", result.errors);
 
@@ -420,7 +420,7 @@ async fn connection_backward_pagination() {
 
     // Grab Bob's cursor, then page backward with before + last
     let edges_result = gql_schema
-        .execute("{ users(orderBy: [ID_ASC], first: 2) { edges { cursor node { name } } } }")
+        .execute("{ users(orderBy: [ROW_ID_ASC], first: 2) { edges { cursor node { name } } } }")
         .await;
     let edges_data = edges_result.data.into_json().expect("serialize");
     let edges = edges_data["users"]["edges"].as_array().expect("edges");
@@ -428,7 +428,7 @@ async fn connection_backward_pagination() {
     let bob_cursor = edges[1]["cursor"].as_str().expect("cursor").to_owned();
 
     let before_query = format!(
-        r#"{{ users(orderBy: [ID_ASC], last: 1, before: "{bob_cursor}") {{ nodes {{ name }} }} }}"#
+        r#"{{ users(orderBy: [ROW_ID_ASC], last: 1, before: "{bob_cursor}") {{ nodes {{ name }} }} }}"#
     );
     let before_result = gql_schema.execute(&before_query).await;
 
@@ -659,7 +659,7 @@ async fn update_mutation() {
     let mutation = r#"
         mutation {
             updateUser(input: {
-                id: "00000000-0000-0000-0000-000000000001",
+                rowId: "00000000-0000-0000-0000-000000000001",
                 patch: {
                     name: "Alice Updated"
                 }
@@ -703,7 +703,7 @@ async fn delete_mutation() {
     let delete_comment = r#"
         mutation {
             deleteComment(input: {
-                id: "20000000-0000-0000-0000-000000000003"
+                rowId: "20000000-0000-0000-0000-000000000003"
             }) {
                 comment {
                     body
@@ -723,7 +723,7 @@ async fn delete_mutation() {
     let delete_post = r#"
         mutation {
             deletePost(input: {
-                id: "10000000-0000-0000-0000-000000000002"
+                rowId: "10000000-0000-0000-0000-000000000002"
             }) {
                 post {
                     title
@@ -743,7 +743,7 @@ async fn delete_mutation() {
     let delete_bob_comment = r#"
         mutation {
             deleteComment(input: {
-                id: "20000000-0000-0000-0000-000000000001"
+                rowId: "20000000-0000-0000-0000-000000000001"
             }) {
                 comment {
                     body
@@ -763,7 +763,7 @@ async fn delete_mutation() {
     let delete_user = r#"
         mutation {
             deleteUser(input: {
-                id: "00000000-0000-0000-0000-000000000002"
+                rowId: "00000000-0000-0000-0000-000000000002"
             }) {
                 user {
                     name
@@ -783,7 +783,7 @@ async fn delete_mutation() {
     assert_eq!(data["deleteUser"]["user"]["name"], "Bob");
 
     // Verify user is gone
-    let verify = r#"{ user(id: "00000000-0000-0000-0000-000000000002") { name } }"#;
+    let verify = r#"{ user(rowId: "00000000-0000-0000-0000-000000000002") { name } }"#;
     let verify_result = gql_schema.execute(verify).await;
 
     teardown_test_schema(&db, &schema_name).await;
@@ -864,7 +864,7 @@ async fn has_many_relationship() {
     let gql_schema = build_test_schema(&db, &schema_name).await;
 
     let query =
-        r#"{ user(id: "00000000-0000-0000-0000-000000000001") { name postsByAuthorId { nodes { title } totalCount } } }"#;
+        r#"{ user(rowId: "00000000-0000-0000-0000-000000000001") { name postsByAuthorId { nodes { title } totalCount } } }"#;
     let result = gql_schema.execute(query).await;
 
     teardown_test_schema(&db, &schema_name).await;
@@ -1226,7 +1226,7 @@ async fn on_plan_hook_filters_real_graphql_queries() {
 
     // Singular query for Bob should return null (filtered out by plugin)
     let bob_result = gql_schema
-        .execute(r#"{ user(id: "00000000-0000-0000-0000-000000000002") { name } }"#)
+        .execute(r#"{ user(rowId: "00000000-0000-0000-0000-000000000002") { name } }"#)
         .await;
     assert!(
         bob_result.errors.is_empty(),
@@ -1351,7 +1351,7 @@ async fn has_many_with_on_plan_hook() {
     // Query Alice's posts — plugin should filter to only published
     let result = gql_schema
         .execute(
-            r#"{ user(id: "00000000-0000-0000-0000-000000000001") { name postsByAuthorId { nodes { title published } totalCount } } }"#,
+            r#"{ user(rowId: "00000000-0000-0000-0000-000000000001") { name postsByAuthorId { nodes { title published } totalCount } } }"#,
         )
         .await;
 
@@ -1438,7 +1438,7 @@ async fn federation_entities_resolves_by_key() {
     let query = r#"
         {
             _entities(representations: [
-                { __typename: "User", id: "00000000-0000-0000-0000-000000000001" }
+                { __typename: "User", rowId: "00000000-0000-0000-0000-000000000001" }
             ]) {
                 ... on User { name email }
             }
@@ -1495,8 +1495,8 @@ async fn federation_entities_resolves_multiple() {
     let query = r#"
         {
             _entities(representations: [
-                { __typename: "User", id: "00000000-0000-0000-0000-000000000001" },
-                { __typename: "User", id: "00000000-0000-0000-0000-000000000002" }
+                { __typename: "User", rowId: "00000000-0000-0000-0000-000000000001" },
+                { __typename: "User", rowId: "00000000-0000-0000-0000-000000000002" }
             ]) {
                 ... on User { name email }
             }
@@ -2591,7 +2591,7 @@ async fn bulk_delete_mutation() {
     let mutation = r#"
         mutation {
             deleteComments(input: {
-                where: { author_id: { eq: "00000000-0000-0000-0000-000000000002" } }
+                where: { authorId: { eq: "00000000-0000-0000-0000-000000000002" } }
             }) {
                 affectedRows
                 comments {
@@ -2645,7 +2645,7 @@ async fn computed_field_from_sql_function() {
     // Query the computed field via GraphQL
     let query = r#"
         query {
-            user(id: "00000000-0000-0000-0000-000000000001") {
+            user(rowId: "00000000-0000-0000-0000-000000000001") {
                 name
                 userDisplayName
             }
@@ -2693,7 +2693,7 @@ async fn computed_field_volatile_excluded() {
     // The volatile function should not be queryable
     let query = r#"
         query {
-            user(id: "00000000-0000-0000-0000-000000000001") {
+            user(rowId: "00000000-0000-0000-0000-000000000001") {
                 name
                 userRandomTag
             }
@@ -2735,7 +2735,7 @@ async fn computed_field_with_setof_return() {
 
     let query = r#"
         query {
-            user(id: "00000000-0000-0000-0000-000000000001") {
+            user(rowId: "00000000-0000-0000-0000-000000000001") {
                 name
                 userEmailParts
             }
@@ -3161,8 +3161,8 @@ async fn nested_connect_input_type_has_pk_fields() {
 
     let id_field = fields
         .iter()
-        .find(|f| f["name"] == "id")
-        .expect("PostUserByAuthorIdConnectInput should have an id field");
+        .find(|f| f["name"] == "rowId")
+        .expect("PostUserByAuthorIdConnectInput should have a rowId field");
 
     // id should be non-null (required)
     assert_eq!(
@@ -3194,7 +3194,7 @@ async fn nested_create_with_belongs_to_connect() {
             createPost(input: {
                 title: "Nested Connect Test"
                 content: "Testing"
-                userByAuthorId: { connect: { id: "00000000-0000-0000-0000-000000000001" } }
+                userByAuthorId: { connect: { rowId: "00000000-0000-0000-0000-000000000001" } }
             }) {
                 post {
                     title
@@ -3465,7 +3465,7 @@ async fn nested_create_connect_nonexistent_returns_error() {
                 title: "Bad Connect"
                 content: "Testing"
                 userByAuthorId: {
-                    connect: { id: "ffffffff-ffff-ffff-ffff-ffffffffffff" }
+                    connect: { rowId: "ffffffff-ffff-ffff-ffff-ffffffffffff" }
                 }
             }) {
                 post { title }
