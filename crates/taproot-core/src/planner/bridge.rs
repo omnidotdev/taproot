@@ -9,8 +9,10 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
-/// Convert a single column's operator object into a `FilterExpr`
-fn parse_column_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterExpr> {
+/// Convert a single column's `{Scalar}Filter` operator object into
+/// `FilterExpr`s, using the `PostGraphile` `ConnectionFilterPlugin` operator
+/// names
+fn parse_filter_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterExpr> {
     let Some(obj) = ops.as_object() else {
         return Vec::new();
     };
@@ -19,40 +21,28 @@ fn parse_column_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterEx
     let suffix = col.pg_cast_suffix(schema);
     let cast = if suffix.is_empty() { None } else { Some(suffix) };
 
+    let cmp = |make: fn(String, Value, Option<String>) -> FilterExpr, val: &Value| {
+        Some(make(column.to_string(), val.clone(), cast.clone()))
+    };
+    let like = |pattern: String| FilterExpr::Like { column: column.to_string(), pattern };
+    let insensitive = |pattern: String| FilterExpr::ILike { column: column.to_string(), pattern };
+
     let mut filters = Vec::new();
 
     for (op, val) in obj {
         let expr = match op.as_str() {
-            "eq" => Some(FilterExpr::Eq {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
-            "ne" | "notEq" => Some(FilterExpr::Ne {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
-            "gt" | "greaterThan" => Some(FilterExpr::Gt {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
-            "gte" | "greaterThanOrEqualTo" => Some(FilterExpr::Gte {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
-            "lt" | "lessThan" => Some(FilterExpr::Lt {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
-            "lte" | "lessThanOrEqualTo" => Some(FilterExpr::Lte {
-                column: column.to_string(),
-                value: val.clone(),
-                cast: cast.clone(),
-            }),
+            "equalTo" => cmp(|c, v, k| FilterExpr::Eq { column: c, value: v, cast: k }, val),
+            "notEqualTo" | "distinctFrom" => {
+                cmp(|c, v, k| FilterExpr::Ne { column: c, value: v, cast: k }, val)
+            }
+            "greaterThan" => cmp(|c, v, k| FilterExpr::Gt { column: c, value: v, cast: k }, val),
+            "greaterThanOrEqualTo" => {
+                cmp(|c, v, k| FilterExpr::Gte { column: c, value: v, cast: k }, val)
+            }
+            "lessThan" => cmp(|c, v, k| FilterExpr::Lt { column: c, value: v, cast: k }, val),
+            "lessThanOrEqualTo" => {
+                cmp(|c, v, k| FilterExpr::Lte { column: c, value: v, cast: k }, val)
+            }
             "in" => val.as_array().map(|arr| FilterExpr::In {
                 column: column.to_string(),
                 values: arr.clone(),
@@ -65,22 +55,14 @@ fn parse_column_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterEx
                     cast: cast.clone(),
                 }))
             }),
-            "like" => val.as_str().map(|s| FilterExpr::Like {
-                column: column.to_string(),
-                pattern: s.to_string(),
-            }),
-            "ilike" => val.as_str().map(|s| FilterExpr::ILike {
-                column: column.to_string(),
-                pattern: s.to_string(),
-            }),
-            "startsWith" => val.as_str().map(|s| FilterExpr::Like {
-                column: column.to_string(),
-                pattern: format!("{}%", escape_like(s)),
-            }),
-            "endsWith" => val.as_str().map(|s| FilterExpr::Like {
-                column: column.to_string(),
-                pattern: format!("%{}", escape_like(s)),
-            }),
+            "like" => val.as_str().map(|s| like(s.to_string())),
+            "likeInsensitive" => val.as_str().map(|s| insensitive(s.to_string())),
+            "includes" => val.as_str().map(|s| like(format!("%{}%", escape_like(s)))),
+            "includesInsensitive" => val.as_str().map(|s| insensitive(format!("%{}%", escape_like(s)))),
+            "startsWith" => val.as_str().map(|s| like(format!("{}%", escape_like(s)))),
+            "startsWithInsensitive" => val.as_str().map(|s| insensitive(format!("{}%", escape_like(s)))),
+            "endsWith" => val.as_str().map(|s| like(format!("%{}", escape_like(s)))),
+            "endsWithInsensitive" => val.as_str().map(|s| insensitive(format!("%{}", escape_like(s)))),
             "isNull" => val.as_bool().map(|b| FilterExpr::IsNull {
                 column: column.to_string(),
                 is_null: b,
@@ -120,6 +102,40 @@ pub fn condition_to_filter(
 ) -> Option<FilterExpr> {
     let obj = condition.as_object()?;
 
+    // `condition` is a flat set of per-column equality checks (PostGraphile
+    // shape): `{ field: value }`. Richer querying goes through `filter`
+    let mut filters = Vec::new();
+    for (key, val) in obj {
+        if let Some(col) = columns
+            .iter()
+            .find(|c| crate::introspect::column_field_name(&c.name) == key.as_str())
+        {
+            let suffix = col.pg_cast_suffix(schema);
+            let cast = if suffix.is_empty() { None } else { Some(suffix) };
+            filters.push(FilterExpr::Eq {
+                column: col.name.clone(),
+                value: val.clone(),
+                cast,
+            });
+        }
+    }
+
+    combine_filters(filters)
+}
+
+/// Convert a GraphQL `filter` JSON object into a `FilterExpr` tree.
+///
+/// Supports per-column `{Scalar}Filter` operator objects (see
+/// [`parse_filter_ops`]) and the `and`, `or`, `not` combinators (the
+/// `PostGraphile` `ConnectionFilterPlugin` shape).
+#[must_use]
+pub fn filter_to_filter(
+    filter: &Value,
+    columns: &[ColumnInfo],
+    schema: &str,
+) -> Option<FilterExpr> {
+    let obj = filter.as_object()?;
+
     let mut filters = Vec::new();
 
     for (key, val) in obj {
@@ -128,7 +144,7 @@ pub fn condition_to_filter(
                 if let Some(arr) = val.as_array() {
                     let sub: Vec<FilterExpr> = arr
                         .iter()
-                        .filter_map(|item| condition_to_filter(item, columns, schema))
+                        .filter_map(|item| filter_to_filter(item, columns, schema))
                         .collect();
                     if !sub.is_empty() {
                         filters.push(FilterExpr::And(sub));
@@ -139,7 +155,7 @@ pub fn condition_to_filter(
                 if let Some(arr) = val.as_array() {
                     let sub: Vec<FilterExpr> = arr
                         .iter()
-                        .filter_map(|item| condition_to_filter(item, columns, schema))
+                        .filter_map(|item| filter_to_filter(item, columns, schema))
                         .collect();
                     if !sub.is_empty() {
                         filters.push(FilterExpr::Or(sub));
@@ -147,7 +163,7 @@ pub fn condition_to_filter(
                 }
             }
             "not" => {
-                if let Some(inner) = condition_to_filter(val, columns, schema) {
+                if let Some(inner) = filter_to_filter(val, columns, schema) {
                     filters.push(FilterExpr::Not(Box::new(inner)));
                 }
             }
@@ -157,7 +173,7 @@ pub fn condition_to_filter(
                     .iter()
                     .find(|c| crate::introspect::column_field_name(&c.name) == column_name)
                 {
-                    filters.extend(parse_column_ops(col, val, schema));
+                    filters.extend(parse_filter_ops(col, val, schema));
                 }
             }
         }
@@ -239,36 +255,36 @@ mod tests {
 
     #[test]
     fn simple_eq_condition() {
-        let condition = serde_json::json!({ "name": { "eq": "Alice" } });
+        let condition = serde_json::json!({ "name": { "equalTo": "Alice" } });
         let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn multiple_columns() {
-        let condition = serde_json::json!({ "name": { "eq": "Alice" }, "email": { "like": "%example%" } });
+        let condition = serde_json::json!({ "name": { "equalTo": "Alice" }, "email": { "like": "%example%" } });
         let result = condition_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn and_combinator() {
-        let condition = serde_json::json!({ "and": [{ "name": { "eq": "Alice" } }, { "email": { "eq": "alice@example.com" } }] });
-        let result = condition_to_filter(&condition, &test_columns(), "public");
+        let condition = serde_json::json!({ "and": [{ "name": { "equalTo": "Alice" } }, { "email": { "equalTo": "alice@example.com" } }] });
+        let result = filter_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn or_combinator() {
-        let condition = serde_json::json!({ "or": [{ "name": { "eq": "Alice" } }, { "name": { "eq": "Bob" } }] });
-        let result = condition_to_filter(&condition, &test_columns(), "public");
+        let condition = serde_json::json!({ "or": [{ "name": { "equalTo": "Alice" } }, { "name": { "equalTo": "Bob" } }] });
+        let result = filter_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 
     #[test]
     fn not_combinator() {
-        let condition = serde_json::json!({ "not": { "name": { "eq": "Alice" } } });
-        let result = condition_to_filter(&condition, &test_columns(), "public");
+        let condition = serde_json::json!({ "not": { "name": { "equalTo": "Alice" } } });
+        let result = filter_to_filter(&condition, &test_columns(), "public");
         assert!(result.is_some());
     }
 

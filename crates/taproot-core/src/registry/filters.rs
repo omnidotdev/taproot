@@ -151,31 +151,105 @@ pub fn build_table_condition(table: &TableInfo, type_name: &str) -> InputObject 
     let condition_name = format!("{type_name}Condition");
     let mut input = InputObject::new(&condition_name);
 
-    // Column condition fields
+    // Flat per-column equality fields (PostGraphile `condition` shape): no
+    // operators, no combinators. Richer querying goes through `{Type}Filter`
     for col in &table.columns {
-        // Skip array columns since conditions on arrays need different semantics
         if col.is_array {
             continue;
         }
 
         let (gql_type, _) = map_udt_to_graphql(&col.udt_name);
-
-        if let Some(cond_type) = condition_type_for_scalar(gql_type) {
-            input = input.field(InputValue::new(crate::introspect::column_field_name(&col.name), TypeRef::named(cond_type)));
+        if condition_type_for_scalar(gql_type).is_some() {
+            input = input.field(InputValue::new(
+                crate::introspect::column_field_name(&col.name),
+                TypeRef::named(gql_type),
+            ));
         }
     }
 
-    // Logical combinators
+    input
+}
+
+/// `{Scalar}Filter` type name for a scalar condition definition
+/// (`StringCondition` -> `StringFilter`).
+fn filter_type_name(condition_type_name: &str) -> String {
+    condition_type_name.replace("Condition", "Filter")
+}
+
+/// Look up the `{Scalar}Filter` type name for a GraphQL scalar.
+#[must_use]
+pub fn filter_type_for_scalar(graphql_type: &str) -> Option<String> {
+    condition_type_for_scalar(graphql_type).map(filter_type_name)
+}
+
+/// Build all `{Scalar}Filter` input types (the rich operator inputs used by the
+/// `filter` argument), using `PostGraphile` `ConnectionFilterPlugin` operator
+/// names.
+#[must_use]
+pub fn build_scalar_filters() -> Vec<InputObject> {
+    SCALAR_CONDITIONS.iter().map(build_scalar_filter).collect()
+}
+
+/// Build a single `{Scalar}Filter` input type from its condition definition
+fn build_scalar_filter(def: &ScalarConditionDef) -> InputObject {
+    let scalar = def.scalar;
+    let mut input = InputObject::new(filter_type_name(def.type_name))
+        .field(InputValue::new("isNull", TypeRef::named("Boolean")))
+        .field(InputValue::new("equalTo", TypeRef::named(scalar)))
+        .field(InputValue::new("notEqualTo", TypeRef::named(scalar)))
+        .field(InputValue::new("in", TypeRef::named_nn_list(scalar)))
+        .field(InputValue::new("notIn", TypeRef::named_nn_list(scalar)));
+
+    if def.has_ordering {
+        input = input
+            .field(InputValue::new("lessThan", TypeRef::named(scalar)))
+            .field(InputValue::new("lessThanOrEqualTo", TypeRef::named(scalar)))
+            .field(InputValue::new("greaterThan", TypeRef::named(scalar)))
+            .field(InputValue::new("greaterThanOrEqualTo", TypeRef::named(scalar)));
+    }
+
+    if def.has_pattern {
+        input = input
+            .field(InputValue::new("includes", TypeRef::named("String")))
+            .field(InputValue::new("includesInsensitive", TypeRef::named("String")))
+            .field(InputValue::new("startsWith", TypeRef::named("String")))
+            .field(InputValue::new("startsWithInsensitive", TypeRef::named("String")))
+            .field(InputValue::new("endsWith", TypeRef::named("String")))
+            .field(InputValue::new("endsWithInsensitive", TypeRef::named("String")))
+            .field(InputValue::new("like", TypeRef::named("String")))
+            .field(InputValue::new("likeInsensitive", TypeRef::named("String")));
+    }
+
+    input
+}
+
+/// Build a per-table `{Type}Filter` input type.
+///
+/// Each column maps to its `{Scalar}Filter`, plus `and`, `or`, `not`
+/// combinators (the `PostGraphile` `ConnectionFilterPlugin` shape).
+#[must_use]
+pub fn build_table_filter(table: &TableInfo, type_name: &str) -> InputObject {
+    let filter_name = format!("{type_name}Filter");
+    let mut input = InputObject::new(&filter_name);
+
+    for col in &table.columns {
+        if col.is_array {
+            continue;
+        }
+
+        let (gql_type, _) = map_udt_to_graphql(&col.udt_name);
+        if let Some(filter_type) = filter_type_for_scalar(gql_type) {
+            input = input.field(InputValue::new(
+                crate::introspect::column_field_name(&col.name),
+                TypeRef::named(&filter_type),
+            ));
+        }
+    }
+
     input = input
-        .field(InputValue::new(
-            "and",
-            TypeRef::named_nn_list(&condition_name),
-        ))
-        .field(InputValue::new(
-            "or",
-            TypeRef::named_nn_list(&condition_name),
-        ))
-        .field(InputValue::new("not", TypeRef::named(&condition_name)));
+        .field(InputValue::new("and", TypeRef::named_nn_list(&filter_name)))
+        .field(InputValue::new("or", TypeRef::named_nn_list(&filter_name)))
+        .field(InputValue::new("not", TypeRef::named(&filter_name)));
 
     input
 }

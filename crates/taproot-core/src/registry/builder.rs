@@ -9,7 +9,7 @@ use async_graphql::dynamic::{
 use crate::db::{Database, RlsContext};
 use crate::error::{Error, Result};
 use crate::introspect::{ColumnInfo, FunctionInfo, IntrospectedSchema, TableInfo, UniqueConstraint};
-use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, order_to_exprs, FilterExpr, PlanNode};
+use crate::planner::{condition_to_filter, execute_plan, execute_plan_count, filter_to_filter, order_to_exprs, FilterExpr, PlanNode};
 use crate::plugin::Plugin;
 use crate::subscription::ChangeBroadcaster;
 
@@ -171,9 +171,10 @@ pub fn build_schema(
         schema_builder = schema_builder.register(Scalar::new(*scalar_name));
     }
 
-    // Register scalar condition types (StringCondition, IntCondition, etc)
-    for condition_input in filters::build_scalar_conditions() {
-        schema_builder = schema_builder.register(condition_input);
+    // Register scalar filter types (StringFilter, IntFilter, etc) used by the
+    // rich `filter` argument
+    for filter_input in filters::build_scalar_filters() {
+        schema_builder = schema_builder.register(filter_input);
     }
 
     // Register PageInfo (shared across all connections)
@@ -216,9 +217,12 @@ pub fn build_schema(
                 );
             }
 
-            // Register per-table condition input type
+            // Register per-table condition (flat equality) and filter (rich)
+            // input types
             let condition_input = filters::build_table_condition(table, &type_name);
             schema_builder = schema_builder.register(condition_input);
+            let filter_input = filters::build_table_filter(table, &type_name);
+            schema_builder = schema_builder.register(filter_input);
 
             // Register per-table order-by enum
             let order_by_enum = ordering::build_table_order_by(table, &type_name);
@@ -1653,6 +1657,7 @@ fn build_list_query(
     let field_name = pluralize(&to_camel_case(&singularize(&table.name)));
     let connection_type_name = format!("{type_name}Connection");
     let condition_type_name = format!("{type_name}Condition");
+    let filter_type_name = format!("{type_name}Filter");
     let order_by_type_name = format!("{type_name}OrderBy");
 
     let schema_name = table.schema.clone();
@@ -1680,10 +1685,19 @@ fn build_list_query(
 
                 let page_args = parse_page_args(&ctx);
 
-                // Convert condition JSON to FilterExpr
-                let filter = condition_json
+                // Combine the flat `condition` (equality) and the rich `filter`
+                // into a single AND-ed FilterExpr
+                let filter_json = extract_json_arg(&ctx, "filter");
+                let cond_expr = condition_json
                     .as_ref()
                     .and_then(|c| condition_to_filter(c, &table_info.columns, &table_info.schema));
+                let filter_expr = filter_json
+                    .as_ref()
+                    .and_then(|f| filter_to_filter(f, &table_info.columns, &table_info.schema));
+                let filter = match (cond_expr, filter_expr) {
+                    (Some(a), Some(b)) => Some(FilterExpr::And(vec![a, b])),
+                    (a, b) => a.or(b),
+                };
 
                 // Convert orderBy JSON to OrderByExpr
                 let order_by = order_json
@@ -1782,6 +1796,10 @@ fn build_list_query(
     .argument(InputValue::new(
         "condition",
         TypeRef::named(&condition_type_name),
+    ))
+    .argument(InputValue::new(
+        "filter",
+        TypeRef::named(&filter_type_name),
     ))
     .argument(InputValue::new(
         "orderBy",
@@ -2544,7 +2562,7 @@ fn build_bulk_update_mutation(
 
                 // Convert condition to filter expression and compile to SQL
                 let filter_expr =
-                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
+                    filter_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()
@@ -2636,7 +2654,7 @@ fn build_bulk_delete_mutation(
                     .unwrap_or(serde_json::Value::Null);
 
                 let filter_expr =
-                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
+                    filter_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()
