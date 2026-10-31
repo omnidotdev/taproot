@@ -176,6 +176,10 @@ pub fn build_schema(
     for filter_input in filters::build_scalar_filters() {
         schema_builder = schema_builder.register(filter_input);
     }
+    // Register scalar list-filter types (StringListFilter, etc) for array columns
+    for list_filter_input in filters::build_scalar_list_filters() {
+        schema_builder = schema_builder.register(list_filter_input);
+    }
 
     // Register PageInfo (shared across all connections)
     schema_builder = schema_builder.register(connection::build_page_info_type());

@@ -17,6 +17,10 @@ fn parse_filter_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterEx
         return Vec::new();
     };
 
+    if col.is_array {
+        return parse_array_ops(col, obj);
+    }
+
     let column = col.name.as_str();
     let suffix = col.pg_cast_suffix(schema);
     let cast = if suffix.is_empty() { None } else { Some(suffix) };
@@ -75,6 +79,50 @@ fn parse_filter_ops(col: &ColumnInfo, ops: &Value, schema: &str) -> Vec<FilterEx
         }
     }
 
+    filters
+}
+
+/// Convert a `{Scalar}ListFilter` operator object (for an array column) into
+/// `FilterExpr`s. Supports `isNull` and the `any*` membership operators, which
+/// compile to `<value> <op> ANY(column)`.
+fn parse_array_ops(col: &ColumnInfo, ops: &serde_json::Map<String, Value>) -> Vec<FilterExpr> {
+    let column = col.name.clone();
+    // Cast the scalar operand for date/time element types; other element types
+    // (uuid, int, text, bool) already bind to a compatible type
+    let elem = col.udt_name.strip_prefix('_').unwrap_or(&col.udt_name);
+    let cast = matches!(
+        elem,
+        "date" | "time" | "timetz" | "timestamp" | "timestamptz" | "interval"
+    )
+    .then(|| format!("::{elem}"));
+
+    let mut filters = Vec::new();
+    for (op, val) in ops {
+        let sql_op = match op.as_str() {
+            "anyEqualTo" => "=",
+            "anyNotEqualTo" => "<>",
+            "anyLessThan" => "<",
+            "anyLessThanOrEqualTo" => "<=",
+            "anyGreaterThan" => ">",
+            "anyGreaterThanOrEqualTo" => ">=",
+            "isNull" => {
+                if let Some(b) = val.as_bool() {
+                    filters.push(FilterExpr::IsNull {
+                        column: column.clone(),
+                        is_null: b,
+                    });
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        filters.push(FilterExpr::ArrayAny {
+            column: column.clone(),
+            op: sql_op.to_string(),
+            value: val.clone(),
+            cast: cast.clone(),
+        });
+    }
     filters
 }
 

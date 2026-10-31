@@ -3722,3 +3722,41 @@ async fn filter_rich_operators_and_combinators() {
     assert_eq!(not_data["users"]["totalCount"], 1);
     assert_eq!(not_data["users"]["nodes"][0]["name"], "Bob");
 }
+
+#[tokio::test]
+async fn array_column_filter() {
+    let Some(db) = connect().await else {
+        return;
+    };
+    let schema_name = test_schema();
+    db.query_raw(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_name}\""))
+        .await
+        .expect("create schema");
+    db.query_raw(&format!(
+        "CREATE TABLE \"{schema_name}\".items (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, tags text[] NOT NULL DEFAULT '{{}}')"
+    ))
+    .await
+    .expect("create table");
+    db.query_raw(&format!(
+        "INSERT INTO \"{schema_name}\".items (name, tags) VALUES ('a', ARRAY['red','blue']), ('b', ARRAY['green']), ('c', ARRAY['blue','green'])"
+    ))
+    .await
+    .expect("seed");
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // ListFilter type exists for the array column's element scalar
+    assert!(gql_schema.sdl().contains("StringListFilter"), "StringListFilter missing from SDL");
+
+    // anyEqualTo: items whose tags contain 'blue' -> a and c
+    let q = r#"{ items(filter: { tags: { anyEqualTo: "blue" } }) { totalCount nodes { name } } }"#;
+    let result = gql_schema.execute(q).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(result.errors.is_empty(), "array filter errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    assert_eq!(data["items"]["totalCount"], 2, "expected 2 items tagged blue");
+    let names: Vec<&str> = data["items"]["nodes"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"a") && names.contains(&"c"), "got {names:?}");
+}

@@ -59,6 +59,9 @@ pub enum FilterExpr {
     Like { column: String, pattern: String },
     ILike { column: String, pattern: String },
     IsNull { column: String, is_null: bool },
+    /// `<value> <op> ANY(<column>)` for array columns, e.g. `$1 = ANY("tags")`.
+    /// `op` is a scalar comparison operator (`=`, `<>`, `<`, `<=`, `>`, `>=`)
+    ArrayAny { column: String, op: String, value: Value, cast: Option<String> },
     And(Vec<Self>),
     Or(Vec<Self>),
     Not(Box<Self>),
