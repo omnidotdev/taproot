@@ -67,7 +67,7 @@ mod tests {
             table: "users".into(),
             filter: Some(FilterExpr::Eq {
                 column: "active".into(),
-                value: serde_json::json!(true),
+                value: serde_json::json!(true), cast: None,
             }),
             order_by: None,
             limit: None,

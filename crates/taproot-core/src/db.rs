@@ -295,7 +295,15 @@ fn bind_json_param<'q>(
         serde_json::Value::Bool(b) => query.bind(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                query.bind(i)
+                // Bind as int4 when it fits: Postgres widens int4 to int8/numeric
+                // implicitly but will not narrow int8, so binding everything as
+                // int8 breaks function overload resolution (e.g. an `integer`
+                // argument) and int4-specific operators
+                if let Ok(narrow) = i32::try_from(i) {
+                    query.bind(narrow)
+                } else {
+                    query.bind(i)
+                }
             } else if let Some(f) = n.as_f64() {
                 query.bind(f)
             } else {

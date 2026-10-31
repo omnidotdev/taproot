@@ -46,6 +46,34 @@ pub struct ColumnInfo {
     pub tags: HashMap<String, String>,
 }
 
+impl ColumnInfo {
+    /// SQL cast suffix (e.g. `::"schema"."status"`) to apply to a parameter
+    /// placeholder bound for this column, or an empty string when none is needed.
+    ///
+    /// A parameter is bound as text (or a native scalar), and Postgres will not
+    /// implicitly coerce text into an enum, composite, or date/time type, so
+    /// those get an explicit cast. Types whose bound representation is already
+    /// compatible (text, numeric, bool, uuid) need no cast. Array columns are
+    /// left uncast (array parameter binding is not yet supported)
+    #[must_use]
+    pub fn pg_cast_suffix(&self, schema: &str) -> String {
+        if self.is_array {
+            return String::new();
+        }
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        if self.data_type == "USER-DEFINED" {
+            return format!("::{}.{}", quote(schema), quote(&self.udt_name));
+        }
+        if matches!(
+            self.udt_name.as_str(),
+            "date" | "time" | "timetz" | "timestamp" | "timestamptz" | "interval"
+        ) {
+            return format!("::{}", self.udt_name);
+        }
+        String::new()
+    }
+}
+
 /// Primary key constraint for a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrimaryKey {

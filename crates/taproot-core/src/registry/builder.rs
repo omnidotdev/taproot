@@ -421,7 +421,7 @@ pub fn build_schema(
                                         table: table_name.clone(),
                                         filter: Some(FilterExpr::Eq {
                                             column: pk_col.clone(),
-                                            value: serde_json::json!(notif.id),
+                                            value: serde_json::json!(notif.id), cast: None,
                                         }),
                                         order_by: None,
                                         limit: Some(1),
@@ -499,7 +499,7 @@ pub fn build_schema(
                         let json_value = gql_value_to_json(key_value.as_value());
                         filter_parts.push(FilterExpr::Eq {
                             column: col_name.clone(),
-                            value: json_value,
+                            value: json_value, cast: None,
                         });
                     }
 
@@ -822,7 +822,7 @@ fn build_object_type(
 
                         let filter = FilterExpr::Eq {
                             column: child_fk_col.clone(),
-                            value: pk_json,
+                            value: pk_json, cast: None,
                         };
 
                         #[allow(clippy::cast_possible_wrap)]
@@ -1439,7 +1439,7 @@ fn build_singular_query(
                     let json_value = value_accessor_to_json(&arg_value);
                     filter_parts.push(FilterExpr::Eq {
                         column: col_name.clone(),
-                        value: json_value,
+                        value: json_value, cast: None,
                     });
                 }
 
@@ -1533,7 +1533,7 @@ fn build_unique_query(
                 let json_value = value_accessor_to_json(&arg_value);
                 filter_parts.push(FilterExpr::Eq {
                     column: col_name.clone(),
-                    value: json_value,
+                    value: json_value, cast: None,
                 });
             }
 
@@ -1680,7 +1680,7 @@ fn build_list_query(
                 // Convert condition JSON to FilterExpr
                 let filter = condition_json
                     .as_ref()
-                    .and_then(|c| condition_to_filter(c, &table_info.columns));
+                    .and_then(|c| condition_to_filter(c, &table_info.columns, &table_info.schema));
 
                 // Convert orderBy JSON to OrderByExpr
                 let order_by = order_json
@@ -2519,7 +2519,8 @@ fn build_bulk_update_mutation(
                     .unwrap_or(serde_json::Value::Null);
 
                 // Convert condition to filter expression and compile to SQL
-                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+                let filter_expr =
+                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()
@@ -2610,7 +2611,8 @@ fn build_bulk_delete_mutation(
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let filter_expr = condition_to_filter(&where_condition, &table_info.columns);
+                let filter_expr =
+                    condition_to_filter(&where_condition, &table_info.columns, &table_info.schema);
 
                 let (filter_sql, filter_params) = filter_expr
                     .as_ref()

@@ -930,7 +930,7 @@ async fn plan_scan_with_filter() {
         table: "users".into(),
         filter: Some(FilterExpr::Eq {
             column: "name".into(),
-            value: serde_json::json!("Alice"),
+            value: serde_json::json!("Alice"), cast: None,
         }),
         order_by: None,
         limit: None,
@@ -1072,7 +1072,7 @@ impl Plugin for OnlyAlicePlugin {
         {
             let alice_filter = FilterExpr::Eq {
                 column: "name".into(),
-                value: serde_json::json!("Alice"),
+                value: serde_json::json!("Alice"), cast: None,
             };
             *filter = Some(match filter.take() {
                 Some(existing) => FilterExpr::And(vec![existing, alice_filter]),
@@ -1130,7 +1130,7 @@ impl Plugin for OnlyAliceQueryPlugin {
         {
             let alice_filter = FilterExpr::Eq {
                 column: "name".into(),
-                value: serde_json::json!("Alice"),
+                value: serde_json::json!("Alice"), cast: None,
             };
             *filter = Some(match filter.take() {
                 Some(existing) => FilterExpr::And(vec![existing, alice_filter]),
@@ -1259,7 +1259,7 @@ impl Plugin for PublishedOnlyPlugin {
 
         let published_filter = FilterExpr::Eq {
             column: "published".into(),
-            value: serde_json::json!(true),
+            value: serde_json::json!(true), cast: None,
         };
         *filter_slot = Some(match filter_slot.take() {
             Some(existing) => FilterExpr::And(vec![existing, published_filter]),
