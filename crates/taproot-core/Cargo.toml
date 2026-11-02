@@ -30,3 +30,4 @@ workspace = true
 
 [dev-dependencies]
 futures-util = "0.3.32"
+serde_json.workspace = true

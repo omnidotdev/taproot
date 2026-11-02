@@ -5,6 +5,7 @@ pub mod federation;
 pub mod filters;
 pub mod loader;
 pub mod mutations;
+pub mod node_id;
 pub mod ordering;
 pub mod scalars;
 pub mod types;
