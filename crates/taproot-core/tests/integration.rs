@@ -3934,3 +3934,91 @@ async fn query_type_is_a_node() {
         "Query"
     );
 }
+
+#[tokio::test]
+async fn overloaded_functions_do_not_panic_build() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema = test_schema();
+    db.query_raw(&format!("create schema \"{schema}\""))
+        .await
+        .expect("create schema");
+    db.query_raw(&format!(
+        "create table \"{schema}\".t (id int primary key)"
+    ))
+    .await
+    .expect("create table");
+    // Two overloads of the same name, as extensions like pgcrypto create
+    db.query_raw(&format!(
+        "create function \"{schema}\".dup(a int) returns int language sql immutable as 'select a'"
+    ))
+    .await
+    .expect("fn1");
+    db.query_raw(&format!(
+        "create function \"{schema}\".dup(a text) returns text language sql immutable as 'select a'"
+    ))
+    .await
+    .expect("fn2");
+
+    let options = IntrospectOptions {
+        schemas: vec![schema.clone()],
+        exclude_tables: Vec::new(),
+        smart_comments: true,
+    };
+    let introspected = introspect(&db, &options).await.expect("introspect");
+    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
+
+    // Must not panic on the overloaded function
+    let gql_schema = build_schema(&introspected, &db_arc, &SchemaOptions::default(), &[], None)
+        .expect("schema build must not panic on overloaded functions");
+
+    teardown_test_schema(&db, &schema).await;
+
+    // The ambiguous overload is dropped, not half-registered
+    assert!(
+        !gql_schema.sdl().contains("dup"),
+        "overloaded function should not be exposed"
+    );
+}
+
+#[tokio::test]
+async fn connection_respects_field_selection() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // totalCount only
+    let r = gql_schema.execute("{ users { totalCount } }").await;
+    assert!(r.errors.is_empty(), "totalCount errors: {:?}", r.errors);
+    assert_eq!(r.data.into_json().unwrap()["users"]["totalCount"], 2);
+
+    // nodes only
+    let r = gql_schema.execute("{ users { nodes { name } } }").await;
+    assert!(r.errors.is_empty(), "nodes errors: {:?}", r.errors);
+    assert_eq!(
+        r.data.into_json().unwrap()["users"]["nodes"].as_array().unwrap().len(),
+        2
+    );
+
+    // aggregates only
+    let r = gql_schema.execute("{ users { aggregates { count } } }").await;
+    assert!(r.errors.is_empty(), "aggregates errors: {:?}", r.errors);
+    assert_eq!(r.data.into_json().unwrap()["users"]["aggregates"]["count"], 2);
+
+    // all three together still work
+    let r = gql_schema
+        .execute("{ users { totalCount nodes { name } aggregates { count } } }")
+        .await;
+    teardown_test_schema(&db, &schema_name).await;
+    assert!(r.errors.is_empty(), "combined errors: {:?}", r.errors);
+    let d = r.data.into_json().unwrap();
+    assert_eq!(d["users"]["totalCount"], 2);
+    assert_eq!(d["users"]["aggregates"]["count"], 2);
+    assert_eq!(d["users"]["nodes"].as_array().unwrap().len(), 2);
+}

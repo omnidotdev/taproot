@@ -378,6 +378,25 @@ pub fn build_schema(
     // Expose non-computed STABLE/IMMUTABLE SQL functions as root query fields
     let table_names: HashSet<String> = all_tables.iter().map(|t| t.name.clone()).collect();
 
+    // Count how many non-computed functions map to each GraphQL field name.
+    // Overloaded functions (same name, different signatures, common in
+    // extensions like pgcrypto or PostGIS) cannot be represented as a single
+    // unambiguous field, so they are dropped rather than registered twice (which
+    // would otherwise panic the schema build)
+    let mut fn_field_counts: HashMap<String, usize> = HashMap::new();
+    for introspected in &schemas {
+        for func in &introspected.functions {
+            if func.computed_table.is_some() {
+                continue;
+            }
+            *fn_field_counts
+                .entry(to_camel_case(&func.name))
+                .or_default() += 1;
+        }
+    }
+    let is_overloaded =
+        |func: &FunctionInfo| fn_field_counts.get(&to_camel_case(&func.name)).copied().unwrap_or(0) > 1;
+
     for introspected in &schemas {
         for func in &introspected.functions {
             // Skip computed fields — they are already registered on their parent type
@@ -387,6 +406,11 @@ pub fn build_schema(
 
             // Only expose STABLE and IMMUTABLE functions
             if func.volatility != 's' && func.volatility != 'i' {
+                continue;
+            }
+
+            // Drop ambiguous overloaded functions
+            if is_overloaded(func) {
                 continue;
             }
 
@@ -410,6 +434,11 @@ pub fn build_schema(
 
             // Only expose VOLATILE functions as mutations
             if func.volatility != 'v' {
+                continue;
+            }
+
+            // Drop ambiguous overloaded functions
+            if is_overloaded(func) {
                 continue;
             }
 
@@ -1755,12 +1784,19 @@ fn build_unique_query(
     field
 }
 
-/// Build lateral join selections for a table's has-many relationships.
-/// Recurses to populate grandchild lateral joins.
-fn build_lateral_selections(
+/// Build lateral join selections for a table's has-many relationships, limited
+/// to the relationships the query actually selected.
+///
+/// `node_las` are the look-ahead contexts for a row of this table (the
+/// connection's `nodes` and `edges.node` selection sets). A child relation is
+/// only joined when it appears under one of them, so a query that never asks
+/// for a relation never pays to fetch it. Recurses into each selected relation
+/// to join grandchildren the same way.
+fn selected_laterals(
     parent_table: &TableInfo,
     all_tables: &[TableInfo],
     visited: &mut HashSet<(String, String)>,
+    node_las: &[async_graphql::Lookahead<'_>],
 ) -> Vec<PlanNode> {
     // Mark this table as visited to prevent cycles
     let key = (parent_table.schema.clone(), parent_table.name.clone());
@@ -1780,8 +1816,32 @@ fn build_lateral_selections(
                 continue;
             }
 
-            // Recurse: find grandchild laterals for this child table
-            let child_selections = build_lateral_selections(child_table, all_tables, visited);
+            // GraphQL field name for this has-many relation on the node type
+            let rel_field = format!(
+                "{}By{}",
+                pluralize(&to_camel_case(&singularize(&child_table.name))),
+                to_pascal_case(&fk.columns[0]),
+            );
+
+            // Which node selection sets actually asked for this relation?
+            let rel_las: Vec<async_graphql::Lookahead<'_>> = node_las
+                .iter()
+                .map(|la| la.field(&rel_field))
+                .filter(async_graphql::Lookahead::exists)
+                .collect();
+            if rel_las.is_empty() {
+                continue;
+            }
+
+            // Grandchild node contexts: `nodes` and `edges.node` of each selected
+            // relation connection
+            let grand_node_las: Vec<async_graphql::Lookahead<'_>> = rel_las
+                .iter()
+                .flat_map(|rla| [rla.field("nodes"), rla.field("edges").field("node")])
+                .collect();
+
+            let child_selections =
+                selected_laterals(child_table, all_tables, visited, &grand_node_las);
 
             selections.push(PlanNode::LateralJoin {
                 parent_key: fk.foreign_columns[0].clone(),
@@ -1866,88 +1926,121 @@ fn build_list_query(
                     .map(|o| order_to_exprs(o, &table_info.columns))
                     .filter(|v| !v.is_empty());
 
-                // Build lateral joins for has-many relationships
-                let mut visited = HashSet::new();
-                let lateral_selections = build_lateral_selections(&table_info, &all_tables_for_lateral, &mut visited);
+                // Only do the work the query actually selected. A connection that
+                // asks for just `totalCount` must not fetch rows or sweep
+                // aggregates; one that asks for just `nodes` must not count
+                let la = ctx.look_ahead();
+                let want_total = la.field("totalCount").exists();
+                let want_page_info = la.field("pageInfo").exists();
+                let want_rows = la.field("nodes").exists() || la.field("edges").exists();
+                let want_agg = la.field("aggregates").exists();
+                let backward = page_args.last.is_some() || page_args.before.is_some();
 
-                // Run the count query first so backward pagination (last/before)
-                // can resolve its window against the total
-                let mut count_plan = PlanNode::Scan {
-                    schema: schema_name.clone(),
-                    table: table_name.clone(),
-                    filter: filter.clone(),
-                    order_by: None,
-                    limit: None,
-                    offset: None,
-                    selections: vec![],
+                // Count only when something needs the total (totalCount, pageInfo,
+                // or backward pagination resolving its window against it)
+                let total_count = if want_total || want_page_info || backward {
+                    let mut count_plan = PlanNode::Scan {
+                        schema: schema_name.clone(),
+                        table: table_name.clone(),
+                        filter: filter.clone(),
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                        selections: vec![],
+                    };
+                    apply_on_plan_hooks(&ctx, &mut count_plan);
+                    execute_plan_count(&count_plan, &db, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?
+                } else {
+                    // Forward pagination reading no total: a sentinel keeps the
+                    // window open. totalCount/pageInfo are unselected, so it never
+                    // surfaces
+                    i64::MAX
                 };
 
-                apply_on_plan_hooks(&ctx, &mut count_plan);
+                // Fetch rows (joining only the relations asked for) only when the
+                // query selected nodes or edges
+                let (rows, skip): (Vec<serde_json::Value>, usize) = if want_rows {
+                    let node_las = [la.field("nodes"), la.field("edges").field("node")];
+                    let mut visited = HashSet::new();
+                    let lateral_selections = selected_laterals(
+                        &table_info,
+                        &all_tables_for_lateral,
+                        &mut visited,
+                        &node_las,
+                    );
 
-                let total_count = execute_plan_count(&count_plan, &db, rls)
-                    .await
-                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+                    let window = connection::compute_window(
+                        page_args,
+                        default_page_size,
+                        max_page_size,
+                        total_count,
+                    );
 
-                let window = connection::compute_window(page_args, default_page_size, max_page_size, total_count);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let mut data_plan = PlanNode::Scan {
+                        schema: schema_name.clone(),
+                        table: table_name.clone(),
+                        filter: filter.clone(),
+                        order_by: order_by.clone(),
+                        limit: Some(window.take as i64),
+                        offset: Some(window.skip as i64),
+                        selections: lateral_selections,
+                    };
+                    apply_on_plan_hooks(&ctx, &mut data_plan);
 
-                // Build plan for data query
-                #[allow(clippy::cast_possible_wrap)]
-                let mut data_plan = PlanNode::Scan {
-                    schema: schema_name.clone(),
-                    table: table_name.clone(),
-                    filter: filter.clone(),
-                    order_by: order_by.clone(),
-                    limit: Some(window.take as i64),
-                    offset: Some(window.skip as i64),
-                    selections: lateral_selections,
+                    let raw = execute_plan(&data_plan, &db, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+
+                    let rows = raw
+                        .iter()
+                        .map(|row| {
+                            row.get("row_to_json").cloned().unwrap_or_else(|| row.clone())
+                        })
+                        .collect();
+                    (rows, window.skip)
+                } else {
+                    (vec![], 0)
                 };
-
-                apply_on_plan_hooks(&ctx, &mut data_plan);
-
-                // Keep the filter for the aggregate query
-                let agg_filter = filter;
-
-                let rows = execute_plan(&data_plan, &db, rls)
-                    .await
-                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
-
-                // Run aggregate query with the same filter (ignoring pagination)
-                let mut agg_sql = aggregates::build_aggregate_sql(
-                    &schema_name,
-                    &table_name,
-                    &table_info.columns,
-                );
-                let agg_params = agg_filter.as_ref().map_or_else(Vec::new, |expr| {
-                    let (where_sql, where_params) =
-                        crate::planner::compile_filter(expr, 1);
-                    let _ = write!(agg_sql, " WHERE {where_sql}");
-                    where_params
-                });
-                let agg_rows = db
-                    .query_with_rls(&agg_sql, &agg_params, rls)
-                    .await
-                    .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
-                let agg_json = agg_rows
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| serde_json::json!({"count": 0}));
-
-                // Unwrap row_to_json wrappers
-                let rows: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|row| {
-                        row.get("row_to_json")
-                            .cloned()
-                            .unwrap_or_else(|| row.clone())
-                    })
-                    .collect();
 
                 let mut response =
-                    connection::build_connection_response(rows, window.skip, total_count);
+                    connection::build_connection_response(rows, skip, total_count);
 
-                // Attach aggregate data to the connection response
-                if let serde_json::Value::Object(ref mut map) = response {
-                    map.insert("aggregates".to_owned(), agg_json);
+                // Compute aggregates only when the query asked for them
+                if want_agg {
+                    // Compute only the sub-aggregates the query selected; min/max
+                    // over text columns is otherwise a needless full pass
+                    let agg_la = la.field("aggregates");
+                    let agg_fields = aggregates::AggregateFields {
+                        sum: agg_la.field("sum").exists(),
+                        avg: agg_la.field("avg").exists(),
+                        min: agg_la.field("min").exists(),
+                        max: agg_la.field("max").exists(),
+                    };
+                    let mut agg_sql = aggregates::build_aggregate_sql(
+                        &schema_name,
+                        &table_name,
+                        &table_info.columns,
+                        &agg_fields,
+                    );
+                    let agg_params = filter.as_ref().map_or_else(Vec::new, |expr| {
+                        let (where_sql, where_params) = crate::planner::compile_filter(expr, 1);
+                        let _ = write!(agg_sql, " WHERE {where_sql}");
+                        where_params
+                    });
+                    let agg_rows = db
+                        .query_with_rls(&agg_sql, &agg_params, rls)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(format!("database error: {e}")))?;
+                    let agg_json = agg_rows
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| serde_json::json!({"count": 0}));
+                    if let serde_json::Value::Object(ref mut map) = response {
+                        map.insert("aggregates".to_owned(), agg_json);
+                    }
                 }
 
                 Ok(Some(FieldValue::value(serde_json_to_gql_value(&response))))

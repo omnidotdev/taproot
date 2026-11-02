@@ -1,0 +1,6 @@
+{
+  "single": "{ users(first: 1, condition: { email: \"user1@example.com\" }) { nodes { rowId name email role } } }",
+  "list": "{ posts(first: 20, condition: { published: true }, orderBy: [CREATED_AT_DESC]) { nodes { rowId title createdAt } pageInfo { hasNextPage endCursor } } }",
+  "nested": "{ posts(first: 20) { nodes { rowId title userByAuthorId { name } commentsByPostId(first: 3) { nodes { body } } } } }",
+  "aggregate": "{ posts(condition: { published: true }) { totalCount } }"
+}

@@ -1,0 +1,6 @@
+{
+  "single": "{ user(where: { email: { _eq: \"user1@example.com\" } }, limit: 1) { id name email role } }",
+  "list": "{ post(where: { published: { _eq: true } }, order_by: { created_at: desc }, limit: 20) { id title created_at } }",
+  "nested": "{ post(limit: 20) { id title author { name } comments(limit: 3) { body } } }",
+  "aggregate": "{ post_aggregate(where: { published: { _eq: true } }) { aggregate { count } } }"
+}
