@@ -203,7 +203,52 @@ fn build_minmax_type(type_name: &str, suffix: &str, columns: &[ColumnInfo]) -> O
 /// Returns the SELECT ... FROM portion without a WHERE clause. The caller
 /// appends the WHERE clause using the same filter as the list query.
 #[must_use]
-pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) -> String {
+/// Which aggregate sub-objects a query selected. `count` is always cheap and
+/// always included; `sum`/`avg`/`min`/`max` each add a per-column pass (and
+/// `min`/`max` over text can be expensive), so they are only computed when the
+/// query asked for them.
+#[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct AggregateFields {
+    pub sum: bool,
+    pub avg: bool,
+    pub min: bool,
+    pub max: bool,
+}
+
+impl AggregateFields {
+    /// Every sub-aggregate (the full, unpruned set)
+    pub const fn all() -> Self {
+        Self {
+            sum: true,
+            avg: true,
+            min: true,
+            max: true,
+        }
+    }
+}
+
+/// Write a `json_build_object('field', AGG(col), ...) AS alias` term for the
+/// given columns
+fn write_agg_object(sql: &mut String, agg: &str, alias: &str, cols: &[&ColumnInfo]) {
+    let _ = write!(sql, ", json_build_object(");
+    for (i, col) in cols.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(sql, ", ");
+        }
+        let field_name = crate::introspect::column_field_name(&col.name);
+        let _ = write!(sql, "'{field_name}', {agg}({col})", col = quote_ident(&col.name));
+    }
+    let _ = write!(sql, ") AS {alias}");
+}
+
+#[must_use]
+pub fn build_aggregate_sql(
+    schema: &str,
+    table: &str,
+    columns: &[ColumnInfo],
+    fields: &AggregateFields,
+) -> String {
     let numeric_cols: Vec<&ColumnInfo> = columns
         .iter()
         .filter(|c| is_numeric(c) && !c.is_array)
@@ -216,68 +261,17 @@ pub fn build_aggregate_sql(schema: &str, table: &str, columns: &[ColumnInfo]) ->
 
     let mut sql = String::from("SELECT COUNT(*) AS count");
 
-    if !numeric_cols.is_empty() {
-        // SUM
-        let _ = write!(sql, ", json_build_object(");
-        for (i, col) in numeric_cols.iter().enumerate() {
-            if i > 0 {
-                let _ = write!(sql, ", ");
-            }
-            let field_name = crate::introspect::column_field_name(&col.name);
-            let _ = write!(
-                sql,
-                "'{field_name}', SUM({col})",
-                col = quote_ident(&col.name)
-            );
-        }
-        let _ = write!(sql, ") AS sum");
-
-        // AVG
-        let _ = write!(sql, ", json_build_object(");
-        for (i, col) in numeric_cols.iter().enumerate() {
-            if i > 0 {
-                let _ = write!(sql, ", ");
-            }
-            let field_name = crate::introspect::column_field_name(&col.name);
-            let _ = write!(
-                sql,
-                "'{field_name}', AVG({col})",
-                col = quote_ident(&col.name)
-            );
-        }
-        let _ = write!(sql, ") AS avg");
+    if fields.sum && !numeric_cols.is_empty() {
+        write_agg_object(&mut sql, "SUM", "sum", &numeric_cols);
     }
-
-    if !orderable_cols.is_empty() {
-        // MIN
-        let _ = write!(sql, ", json_build_object(");
-        for (i, col) in orderable_cols.iter().enumerate() {
-            if i > 0 {
-                let _ = write!(sql, ", ");
-            }
-            let field_name = crate::introspect::column_field_name(&col.name);
-            let _ = write!(
-                sql,
-                "'{field_name}', MIN({col})",
-                col = quote_ident(&col.name)
-            );
-        }
-        let _ = write!(sql, ") AS min");
-
-        // MAX
-        let _ = write!(sql, ", json_build_object(");
-        for (i, col) in orderable_cols.iter().enumerate() {
-            if i > 0 {
-                let _ = write!(sql, ", ");
-            }
-            let field_name = crate::introspect::column_field_name(&col.name);
-            let _ = write!(
-                sql,
-                "'{field_name}', MAX({col})",
-                col = quote_ident(&col.name)
-            );
-        }
-        let _ = write!(sql, ") AS max");
+    if fields.avg && !numeric_cols.is_empty() {
+        write_agg_object(&mut sql, "AVG", "avg", &numeric_cols);
+    }
+    if fields.min && !orderable_cols.is_empty() {
+        write_agg_object(&mut sql, "MIN", "min", &orderable_cols);
+    }
+    if fields.max && !orderable_cols.is_empty() {
+        write_agg_object(&mut sql, "MAX", "max", &orderable_cols);
     }
 
     let _ = write!(
@@ -385,7 +379,7 @@ mod tests {
             make_column("name", "text"),
         ];
 
-        let sql = build_aggregate_sql("public", "orders", &columns);
+        let sql = build_aggregate_sql("public", "orders", &columns, &AggregateFields::all());
 
         assert!(sql.contains("COUNT(*) AS count"));
         assert!(sql.contains("SUM(\"id\")"));
@@ -411,7 +405,7 @@ mod tests {
             make_column("email", "varchar"),
         ];
 
-        let sql = build_aggregate_sql("public", "users", &columns);
+        let sql = build_aggregate_sql("public", "users", &columns, &AggregateFields::all());
 
         assert!(sql.contains("COUNT(*) AS count"));
         assert!(!sql.contains("SUM"));
@@ -427,7 +421,7 @@ mod tests {
             make_column("metadata", "jsonb"),
         ];
 
-        let sql = build_aggregate_sql("public", "items", &columns);
+        let sql = build_aggregate_sql("public", "items", &columns, &AggregateFields::all());
 
         assert!(sql.contains("MIN(\"id\")"));
         assert!(sql.contains("MAX(\"id\")"));
@@ -439,7 +433,7 @@ mod tests {
     fn aggregate_sql_camel_case_keys() {
         let columns = vec![make_column("total_amount", "numeric")];
 
-        let sql = build_aggregate_sql("public", "orders", &columns);
+        let sql = build_aggregate_sql("public", "orders", &columns, &AggregateFields::all());
 
         assert!(sql.contains("'totalAmount'"));
     }
@@ -448,7 +442,7 @@ mod tests {
     fn aggregate_sql_escapes_identifiers() {
         let columns = vec![make_column("user\"name", "text")];
 
-        let sql = build_aggregate_sql("my\"schema", "my\"table", &columns);
+        let sql = build_aggregate_sql("my\"schema", "my\"table", &columns, &AggregateFields::all());
 
         assert!(sql.contains("\"my\"\"schema\""));
         assert!(sql.contains("\"my\"\"table\""));
