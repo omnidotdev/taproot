@@ -149,29 +149,26 @@ pub fn build_on_conflict_input(type_name: &str) -> InputObject {
     input
 }
 
-/// Build a `Create{Type}Input` with all non-generated columns.
+/// Build the inner `{Type}Input` holding the row's own columns.
 ///
 /// Required fields are non-nullable columns without defaults. All other
 /// non-generated columns are optional. Includes an optional `onConflict`
 /// field for upsert support. Nested relationship fields are appended from
-/// the provided descriptors.
+/// the provided descriptors. This is the type carried by the `create`
+/// mutation's input envelope and by nested `create` fields, mirroring
+/// Postgraphile's `createFoo(input: { foo: FooInput })` shape.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn build_create_input(
+pub fn build_input_object(
     table: &TableInfo,
     type_name: &str,
     enum_names: &HashSet<String>,
     nested_fields: &[NestedRelField],
     optional_columns: &HashSet<String>,
 ) -> InputObject {
-    let input_name = format!("Create{type_name}Input");
+    let input_name = format!("{type_name}Input");
     let on_conflict_type = format!("{type_name}OnConflict");
     let mut input = InputObject::new(&input_name);
-
-    input = input.field(InputValue::new(
-        "clientMutationId",
-        TypeRef::named(TypeRef::STRING),
-    ));
 
     for col in &table.columns {
         if col.is_generated {
@@ -206,6 +203,26 @@ pub fn build_create_input(
     ));
 
     input
+}
+
+/// Build the `Create{Type}Input` envelope that wraps the row input.
+///
+/// Mirrors Postgraphile: `Create{Type}Input { clientMutationId, <field>: {Type}Input! }`
+/// where `<field>` is the singular camelCase table field name (e.g. `user`).
+#[must_use]
+pub fn build_create_input(type_name: &str, table_field_name: &str) -> InputObject {
+    let input_name = format!("Create{type_name}Input");
+    let row_input_type = format!("{type_name}Input");
+
+    InputObject::new(&input_name)
+        .field(InputValue::new(
+            "clientMutationId",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            table_field_name,
+            TypeRef::named_nn(&row_input_type),
+        ))
 }
 
 /// Build an `Update{Type}Input` with PK field(s) required and a `patch` field.
@@ -517,7 +534,7 @@ pub fn delete_to_sql(
 #[must_use]
 pub fn build_bulk_create_input(type_name: &str, plural_type_name: &str) -> InputObject {
     let input_name = format!("Create{plural_type_name}BulkInput");
-    let create_input_type = format!("Create{type_name}Input");
+    let create_input_type = format!("{type_name}Input");
     let mut input = InputObject::new(&input_name);
 
     input = input.field(InputValue::new(

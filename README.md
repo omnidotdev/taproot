@@ -47,6 +47,7 @@ taproot -c taproot.yaml
 
 - **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types (a column named `id` is exposed as `rowId`)
 - **Relay pagination** — cursor connections with `first`/`after`/`last`/`before`/`offset`
+- **Global object identification** — every row carries an opaque Relay `nodeId`, refetchable through the `node(nodeId:)` root field
 - **Filtering** — a flat `condition` (equality) plus a rich `filter` with comparison, pattern, and array operators and `and`/`or`/`not`
 - **Mutations** — `create`/`update`/`delete`, bulk variants, and nested `create`/`connect` for related records
 - **Subscriptions** — real-time change notifications over Postgres `LISTEN`/`NOTIFY`

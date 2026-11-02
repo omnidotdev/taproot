@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{
-    Enum, EnumItem, Field, FieldFuture, FieldValue, InputValue, Object, Scalar, Schema, TypeRef,
+    Enum, EnumItem, Field, FieldFuture, FieldValue, InputValue, Interface, InterfaceField, Object,
+    Scalar, Schema, TypeRef,
 };
 
 use crate::db::{Database, RlsContext};
@@ -15,6 +16,7 @@ use crate::subscription::ChangeBroadcaster;
 
 use super::federation;
 use super::loader::{LoaderKey, LoaderRegistry, normalize_key};
+use super::node_id::{decode_node_id, encode_node_id};
 use super::scalars::map_udt_to_graphql;
 use super::types::SchemaOptions;
 use super::{aggregates, connection, filters, mutations, ordering};
@@ -22,6 +24,14 @@ use super::{aggregates, connection, filters, mutations, ordering};
 /// Schema-level storage for plugins, accessible by resolvers via `ctx.data()`
 #[derive(Clone)]
 struct PluginStore(Arc<Vec<Arc<dyn Plugin>>>);
+
+/// How to refetch a row for the Relay `node(nodeId:)` root field: the physical
+/// schema/table and the primary-key columns, in column order
+struct NodeFetchInfo {
+    schema: String,
+    table: String,
+    pk_columns: Vec<String>,
+}
 
 /// Apply all plugin `on_plan` hooks to a plan node
 fn apply_on_plan_hooks(
@@ -184,6 +194,15 @@ pub fn build_schema(
     // Register PageInfo (shared across all connections)
     schema_builder = schema_builder.register(connection::build_page_info_type());
 
+    // Register the Relay Node interface; every table type with a primary key
+    // implements it and exposes a global `nodeId`
+    schema_builder = schema_builder.register(
+        Interface::new("Node").field(InterfaceField::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+    );
+
+    // Map GraphQL type name -> how to refetch one of its rows, for `node()`
+    let mut node_registry: HashMap<String, NodeFetchInfo> = HashMap::new();
+
     // Register custom scalars and build object types
     for introspected in &schemas {
         for table in &introspected.tables {
@@ -201,6 +220,18 @@ pub fn build_schema(
                 &introspected.name,
             );
             schema_builder = schema_builder.register(object);
+
+            // Record how to refetch this type's rows for the Relay node() field
+            if let Some(pk) = &table.primary_key {
+                node_registry.insert(
+                    type_name.clone(),
+                    NodeFetchInfo {
+                        schema: introspected.name.clone(),
+                        table: table.name.clone(),
+                        pk_columns: pk.columns.clone(),
+                    },
+                );
+            }
 
             // Register federation entity mapping
             if options.federation
@@ -400,6 +431,86 @@ pub fn build_schema(
         }
     }
 
+    // Relay Global Object Identification: `node(nodeId: ID!): Node` refetches any
+    // object by its opaque global id
+    {
+        let node_registry = Arc::new(node_registry);
+        let node_db = Arc::clone(db);
+        query = query.field(
+            Field::new("node", TypeRef::named("Node"), move |ctx| {
+                let node_registry = Arc::clone(&node_registry);
+                let node_db = Arc::clone(&node_db);
+                FieldFuture::new(async move {
+                    let node_id = ctx.args.try_get("nodeId")?.string()?.to_string();
+                    let (type_name, pk_values) = decode_node_id(&node_id)
+                        .map_err(|e| async_graphql::Error::new(format!("invalid nodeId: {e}")))?;
+
+                    // The root Query is itself a Node and refetches as an empty object
+                    if type_name == "Query" {
+                        return Ok(Some(
+                            FieldValue::value(async_graphql::Value::Object(
+                                async_graphql::indexmap::IndexMap::default(),
+                            ))
+                            .with_type("Query"),
+                        ));
+                    }
+
+                    // A well-formed id for a type that is not exposed resolves to null
+                    let Some(info) = node_registry.get(&type_name) else {
+                        return Ok(None);
+                    };
+
+                    if pk_values.len() != info.pk_columns.len() {
+                        return Err(async_graphql::Error::new(
+                            "invalid nodeId: wrong key arity",
+                        ));
+                    }
+
+                    let rls = ctx.data::<RlsContext>().ok();
+
+                    let mut filter_parts: Vec<FilterExpr> = info
+                        .pk_columns
+                        .iter()
+                        .zip(pk_values)
+                        .map(|(col, value)| FilterExpr::Eq {
+                            column: col.clone(),
+                            value,
+                            cast: None,
+                        })
+                        .collect();
+
+                    let filter = if filter_parts.len() == 1 {
+                        filter_parts.remove(0)
+                    } else {
+                        FilterExpr::And(filter_parts)
+                    };
+
+                    let mut plan = PlanNode::Scan {
+                        schema: info.schema.clone(),
+                        table: info.table.clone(),
+                        filter: Some(filter),
+                        order_by: None,
+                        limit: Some(1),
+                        offset: None,
+                        selections: vec![],
+                    };
+
+                    apply_on_plan_hooks(&ctx, &mut plan);
+
+                    let rows = execute_plan(&plan, &node_db, rls).await.map_err(|e| {
+                        async_graphql::Error::new(format!("database error: {e}"))
+                    })?;
+
+                    Ok(rows
+                        .into_iter()
+                        .next()
+                        .map(|row| row_json_to_field_value(&row).with_type(type_name.clone())))
+                })
+            })
+            .argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+        );
+    }
+
     // Relay-classic nested `query` root: `query: Query!` returns the Query type
     // itself, so clients can re-enter the root from any point in a document
     query = query.field(Field::new(
@@ -413,6 +524,22 @@ pub fn build_schema(
             })
         },
     ));
+
+    // The root Query type is itself a Node (Postgraphile parity), with a
+    // constant global id
+    query = query
+        .field(Field::new(
+            "nodeId",
+            TypeRef::named_nn(TypeRef::ID),
+            |_ctx| {
+                FieldFuture::new(async {
+                    Ok(Some(FieldValue::value(async_graphql::Value::String(
+                        encode_node_id("Query", &[]),
+                    ))))
+                })
+            },
+        ))
+        .implement("Node");
 
     schema_builder = schema_builder.register(query);
 
@@ -944,6 +1071,37 @@ fn build_object_type(
     {
         let key_fields: Vec<String> = pk.columns.iter().map(|c| crate::introspect::column_field_name(c)).collect();
         object = object.key(key_fields.join(" "));
+    }
+
+    // Relay Global Object Identification: expose an opaque `nodeId` derived from
+    // the primary key and implement the Node interface, so `node(nodeId:)` can
+    // refetch this type by its global id
+    if let Some(pk) = &table.primary_key {
+        let pk_columns = pk.columns.clone();
+        let node_type_name = type_name.to_string();
+        let node_field = Field::new("nodeId", TypeRef::named_nn(TypeRef::ID), move |ctx| {
+            let pk_columns = pk_columns.clone();
+            let node_type_name = node_type_name.clone();
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                let async_graphql::Value::Object(map) = parent else {
+                    return Ok(None);
+                };
+
+                let mut pk_values = Vec::with_capacity(pk_columns.len());
+                for col in &pk_columns {
+                    let Some(value) = map.get(col.as_str()) else {
+                        return Ok(None);
+                    };
+                    pk_values.push(gql_value_to_json(value));
+                }
+
+                Ok(Some(FieldValue::value(async_graphql::Value::String(
+                    encode_node_id(&node_type_name, &pk_values),
+                ))))
+            })
+        });
+        object = object.field(node_field).implement("Node");
     }
 
     object
@@ -2065,7 +2223,8 @@ fn build_nested_rel_inputs(
 
         let container_name = format!("{type_name}{pascal_rel_field}Input");
         let connect_name = format!("{type_name}{pascal_rel_field}ConnectInput");
-        let related_create_input = format!("Create{related_type}Input");
+        // Nested `create` carries the inner row input, not the create envelope
+        let related_create_input = format!("{related_type}Input");
 
         let related_pk_cols: Vec<ColumnInfo> = related_table
             .primary_key
@@ -2163,7 +2322,7 @@ fn build_nested_rel_inputs(
             );
 
             let container_name = format!("{type_name}{pascal_rel_field}Input");
-            let child_create_input = format!("Create{child_type}Input");
+            let child_create_input = format!("{child_type}Input");
 
             schema_builder = schema_builder.register(
                 mutations::build_nested_has_many_input(&container_name, &child_create_input),
@@ -2237,13 +2396,17 @@ fn register_mutation_types(
 
         schema_builder =
             schema_builder.register(mutations::build_on_conflict_input(type_name));
-        schema_builder = schema_builder.register(mutations::build_create_input(
+        // Inner row input ({Type}Input) carries the columns + nested fields
+        schema_builder = schema_builder.register(mutations::build_input_object(
             table,
             type_name,
             enum_names,
             &nested_fields,
             &belongs_to_fk_columns,
         ));
+        // Create envelope: Create{Type}Input { clientMutationId, <field>: {Type}Input! }
+        schema_builder =
+            schema_builder.register(mutations::build_create_input(type_name, table_field_name));
         schema_builder = schema_builder.register(build_mutation_payload(
             &format!("Create{type_name}"),
             table_field_name,
@@ -2358,6 +2521,16 @@ fn build_mutation_payload(
             })
         },
     ));
+
+    // Postgraphile-style `query: Query` lets clients refetch arbitrary data in
+    // the same round trip as the mutation
+    payload = payload.field(Field::new("query", TypeRef::named("Query"), |_ctx| {
+        FieldFuture::new(async {
+            Ok(Some(FieldValue::value(async_graphql::Value::Object(
+                async_graphql::indexmap::IndexMap::default(),
+            ))))
+        })
+    }));
 
     payload
 }
@@ -2737,12 +2910,18 @@ fn build_create_mutation(
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
                 let input_value = ctx.args.try_get("input")?;
-                let mut input_json = gql_value_to_json(input_value.as_value());
+                let outer = gql_value_to_json(input_value.as_value());
 
-                let client_mutation_id = input_json
+                let client_mutation_id = outer
                     .get("clientMutationId")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+
+                // The row's own columns and nested fields live under the table
+                // field key (Postgraphile-style `input: { <field>: {...} }`)
+                let mut input_json = outer.get(&table_field).cloned().ok_or_else(|| {
+                    async_graphql::Error::new(format!("input must contain `{table_field}`"))
+                })?;
 
                 // Check if any nested relationship fields are present
                 let has_nested = nested_rels.iter().any(|rel| {

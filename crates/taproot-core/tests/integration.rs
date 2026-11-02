@@ -614,11 +614,11 @@ async fn create_mutation() {
 
     let mutation = r#"
         mutation {
-            createUser(input: {
+            createUser(input: { user: {
                 name: "Charlie",
                 email: "charlie@example.com",
                 role: viewer
-            }) {
+            } }) {
                 clientMutationId
                 user {
                     name
@@ -2161,10 +2161,10 @@ async fn composite_pk_create_mutation() {
 
     let mutation = r#"
         mutation {
-            createUserRole(input: {
+            createUserRole(input: { userRole: {
                 userId: "00000000-0000-0000-0000-000000000002",
                 roleId: "a0000000-0000-0000-0000-000000000002"
-            }) {
+            } }) {
                 userRole {
                     userId
                     roleId
@@ -2426,7 +2426,7 @@ async fn upsert_with_on_conflict() {
     let mutation = format!(
         r#"
         mutation {{
-            createUser(input: {{
+            createUser(input: {{ user: {{
                 name: "Updated Alice",
                 email: "alice@example.com",
                 role: admin,
@@ -2434,7 +2434,7 @@ async fn upsert_with_on_conflict() {
                     constraint: "{constraint_name}",
                     updateColumns: ["name"]
                 }}
-            }}) {{
+            }} }}) {{
                 user {{
                     name
                     email
@@ -2529,11 +2529,11 @@ async fn bulk_update_mutation() {
     // First add a viewer
     let setup = r#"
         mutation {
-            createUser(input: {
+            createUser(input: { user: {
                 name: "Charlie",
                 email: "charlie@example.com",
                 role: viewer
-            }) {
+            } }) {
                 user { name }
             }
         }
@@ -3037,7 +3037,7 @@ async fn nested_create_belongs_to_input_type_exists() {
 
     let query = r#"
         {
-            __type(name: "CreatePostInput") {
+            __type(name: "PostInput") {
                 inputFields {
                     name
                     type { name kind ofType { name } }
@@ -3064,7 +3064,7 @@ async fn nested_create_belongs_to_input_type_exists() {
     let field = fields
         .iter()
         .find(|f| f["name"] == "userByAuthorId")
-        .expect("CreatePostInput should have a userByAuthorId field");
+        .expect("PostInput should have a userByAuthorId field");
 
     assert_eq!(
         field["type"]["name"].as_str(),
@@ -3086,7 +3086,7 @@ async fn nested_create_has_many_input_type_exists() {
 
     let query = r#"
         {
-            __type(name: "CreateUserInput") {
+            __type(name: "UserInput") {
                 inputFields {
                     name
                     type { name kind ofType { name } }
@@ -3113,7 +3113,7 @@ async fn nested_create_has_many_input_type_exists() {
     let field = fields
         .iter()
         .find(|f| f["name"] == "postsByAuthorId")
-        .expect("CreateUserInput should have a postsByAuthorId field");
+        .expect("UserInput should have a postsByAuthorId field");
 
     assert_eq!(
         field["type"]["name"].as_str(),
@@ -3191,11 +3191,11 @@ async fn nested_create_with_belongs_to_connect() {
     // Use Alice's known UUID to connect
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Nested Connect Test"
                 content: "Testing"
                 userByAuthorId: { connect: { rowId: "00000000-0000-0000-0000-000000000001" } }
-            }) {
+            } }) {
                 post {
                     title
                     userByAuthorId { name }
@@ -3233,7 +3233,7 @@ async fn nested_create_with_belongs_to_create() {
 
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Nested Create Test"
                 content: "Testing"
                 userByAuthorId: {
@@ -3242,7 +3242,7 @@ async fn nested_create_with_belongs_to_create() {
                         email: "inline@test.com"
                     }
                 }
-            }) {
+            } }) {
                 post {
                     title
                     userByAuthorId { name email }
@@ -3281,7 +3281,7 @@ async fn nested_create_with_has_many_create() {
 
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Post With Comments"
                 content: "Testing"
                 authorId: "00000000-0000-0000-0000-000000000001"
@@ -3291,7 +3291,7 @@ async fn nested_create_with_has_many_create() {
                         { body: "Comment 2", authorId: "00000000-0000-0000-0000-000000000001" }
                     ]
                 }
-            }) {
+            } }) {
                 post {
                     title
                     commentsByPostId { edges { node { body } } }
@@ -3340,7 +3340,7 @@ async fn nested_create_combined_belongs_to_and_has_many() {
 
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Full Nested Test"
                 content: "Both directions"
                 userByAuthorId: {
@@ -3351,7 +3351,7 @@ async fn nested_create_combined_belongs_to_and_has_many() {
                         { body: "Nested comment", authorId: "00000000-0000-0000-0000-000000000001" }
                     ]
                 }
-            }) {
+            } }) {
                 post {
                     title
                     userByAuthorId { name }
@@ -3407,7 +3407,7 @@ async fn nested_create_rolls_back_on_child_failure() {
     // body (body is NOT NULL), which should fail and roll back everything
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Should Rollback"
                 content: "Testing rollback"
                 userByAuthorId: {
@@ -3418,7 +3418,7 @@ async fn nested_create_rolls_back_on_child_failure() {
                         { authorId: "00000000-0000-0000-0000-000000000001" }
                     ]
                 }
-            }) {
+            } }) {
                 post { title }
             }
         }
@@ -3461,13 +3461,13 @@ async fn nested_create_connect_nonexistent_returns_error() {
 
     let mutation = r#"
         mutation {
-            createPost(input: {
+            createPost(input: { post: {
                 title: "Bad Connect"
                 content: "Testing"
                 userByAuthorId: {
                     connect: { rowId: "ffffffff-ffff-ffff-ffff-ffffffffffff" }
                 }
-            }) {
+            } }) {
                 post { title }
             }
         }
@@ -3759,4 +3759,178 @@ async fn array_column_filter() {
     assert_eq!(data["items"]["totalCount"], 2, "expected 2 items tagged blue");
     let names: Vec<&str> = data["items"]["nodes"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"a") && names.contains(&"c"), "got {names:?}");
+}
+
+#[tokio::test]
+async fn global_object_identification_node_refetch() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // SDL exposes the Relay Node interface, implementations, and the root field
+    let sdl = gql_schema.sdl();
+    assert!(sdl.contains("interface Node"), "Node interface missing from SDL");
+    assert!(
+        sdl.contains("implements Node"),
+        "no type implements Node in SDL"
+    );
+    assert!(
+        sdl.contains("nodeId: ID!"),
+        "nodeId field missing from SDL"
+    );
+    assert!(
+        sdl.contains("node(nodeId: ID!): Node"),
+        "node() root field missing from SDL"
+    );
+
+    // Pull a global id out of a list query
+    let listed = gql_schema
+        .execute("{ users { nodes { nodeId name } } }")
+        .await;
+    assert!(listed.errors.is_empty(), "list errors: {:?}", listed.errors);
+    let data = listed.data.into_json().expect("serialize");
+    let nodes = data["users"]["nodes"].as_array().expect("nodes array");
+    let alice = nodes
+        .iter()
+        .find(|n| n["name"] == "Alice")
+        .expect("Alice present");
+    let node_id = alice["nodeId"].as_str().expect("nodeId present").to_string();
+    assert!(!node_id.is_empty(), "nodeId should not be empty");
+
+    // Refetch the same row by its global id through the Node interface
+    let query = format!("{{ node(nodeId: \"{node_id}\") {{ __typename ... on User {{ name email }} }} }}");
+    let refetched = gql_schema.execute(&query).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        refetched.errors.is_empty(),
+        "node refetch errors: {:?}",
+        refetched.errors
+    );
+    let rdata = refetched.data.into_json().expect("serialize");
+    assert_eq!(rdata["node"]["__typename"], "User");
+    assert_eq!(rdata["node"]["name"], "Alice");
+    assert_eq!(rdata["node"]["email"], "alice@example.com");
+}
+
+#[tokio::test]
+async fn node_refetch_malformed_and_unknown() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // A malformed id is a client error, not a panic or 500
+    let malformed = gql_schema
+        .execute(r#"{ node(nodeId: "!!!not-base64") { __typename } }"#)
+        .await;
+    assert!(
+        !malformed.errors.is_empty(),
+        "expected an error for a malformed nodeId"
+    );
+
+    // A well-formed id for a type that does not exist resolves to null
+    let ghost = taproot_core::registry::node_id::encode_node_id(
+        "Ghost",
+        &[serde_json::json!("00000000-0000-0000-0000-000000000009")],
+    );
+    let unknown = gql_schema
+        .execute(&format!("{{ node(nodeId: \"{ghost}\") {{ __typename }} }}"))
+        .await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(
+        unknown.errors.is_empty(),
+        "unknown-type refetch should not error: {:?}",
+        unknown.errors
+    );
+    let udata = unknown.data.into_json().expect("serialize");
+    assert!(udata["node"].is_null(), "unknown type should resolve to null");
+}
+
+#[tokio::test]
+async fn mutation_payload_exposes_query_root() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Postgraphile-style: the payload carries a `query` back into the Query root
+    let mutation = r#"
+        mutation {
+            createUser(input: { user: {
+                name: "Zoe",
+                email: "zoe@example.com",
+                role: viewer
+            } }) {
+                user { name }
+                query { users { totalCount } }
+            }
+        }
+    "#;
+
+    let result = gql_schema.execute(mutation).await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(result.errors.is_empty(), "payload query errors: {:?}", result.errors);
+    let data = result.data.into_json().expect("serialize");
+    assert_eq!(data["createUser"]["user"]["name"], "Zoe");
+    // 2 seeded users + Zoe
+    assert_eq!(data["createUser"]["query"]["users"]["totalCount"], 3);
+}
+
+#[tokio::test]
+async fn query_type_is_a_node() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    assert!(
+        gql_schema.sdl().contains("type Query implements Node"),
+        "Query should implement Node"
+    );
+
+    // The Query's own nodeId round-trips through node()
+    let got = gql_schema.execute("{ nodeId }").await;
+    assert!(got.errors.is_empty(), "query nodeId errors: {:?}", got.errors);
+    let id = got
+        .data
+        .into_json()
+        .expect("serialize")["nodeId"]
+        .as_str()
+        .expect("nodeId")
+        .to_string();
+
+    let back = gql_schema
+        .execute(&format!("{{ node(nodeId: \"{id}\") {{ __typename }} }}"))
+        .await;
+
+    teardown_test_schema(&db, &schema_name).await;
+
+    assert!(back.errors.is_empty(), "node() on query id errors: {:?}", back.errors);
+    assert_eq!(
+        back.data.into_json().expect("serialize")["node"]["__typename"],
+        "Query"
+    );
 }
