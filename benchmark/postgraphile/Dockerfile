@@ -1,0 +1,9 @@
+FROM node:22-slim
+
+WORKDIR /app
+COPY package.json ./
+RUN npm install --no-audit --no-fund
+COPY server.mjs ./
+
+EXPOSE 5000
+CMD ["node", "server.mjs"]

@@ -1,0 +1,8 @@
+database:
+  url: "postgres://postgres:postgres@localhost:55434/bench"
+  # match a typical node `pg` Pool default so the comparison is pool-for-pool
+  pool_size: 10
+  schemas: ["public"]
+server:
+  listen: "0.0.0.0:4000"
+  playground: false

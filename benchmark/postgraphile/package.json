@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-postgraphile",
+  "private": true,
+  "type": "module",
+  "description": "PostGraphile v5 contender for the Taproot benchmark (Amber + simplify inflection, matching the Omni fleet config).",
+  "dependencies": {
+    "postgraphile": "^5.0.0-rc.0",
+    "@graphile/simplify-inflection": "^8.0.0-rc.0"
+  }
+}
