@@ -1,6 +1,6 @@
 {
   "name": "@omnidotdev/taproot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A pure Rust library and server that auto-generates a full GraphQL API from a PostgreSQL database.",
   "type": "module",
