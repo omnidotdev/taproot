@@ -11,11 +11,21 @@
 
 ## Installation
 
+Install the latest release with the install script. It downloads the prebuilt
+binary for your platform and places it in `~/.local/bin` (or `/usr/local/bin`
+when run as root):
+
+```bash
+curl -fsSL https://taproot.omni.dev/install.sh | sh
+```
+
+Other channels:
+
 | Platform | Channel | Command / Link |
 | --- | --- | --- |
+| macOS, Linux | [Homebrew](https://github.com/omnidotdev/homebrew-tap) | `brew install omnidotdev/tap/taproot` |
+| Arch Linux | [AUR](https://aur.archlinux.org/packages/omnidotdev-taproot) | `paru -S omnidotdev-taproot` (`-bin` for the prebuilt) |
 | All | [GitHub Releases](https://github.com/omnidotdev/taproot/releases) | Download the `taproot` server binary |
-| All | [crates.io](https://crates.io/crates/taproot-server) | `cargo install taproot-server` |
-| Library | [crates.io](https://crates.io/crates/taproot-core) | `taproot-core = "0.1"` in `Cargo.toml` |
 
 ### Build from source
 
@@ -23,6 +33,15 @@
 git clone https://github.com/omnidotdev/taproot
 cd taproot
 cargo build --release          # binary at target/release/taproot
+```
+
+### Use as a library
+
+`taproot-core` embeds the schema generator in a Rust service. Until it is
+published to a registry, depend on it by git:
+
+```toml
+taproot-core = { git = "https://github.com/omnidotdev/taproot" }
 ```
 
 ## Quick Start

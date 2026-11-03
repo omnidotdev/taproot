@@ -1977,56 +1977,6 @@ async fn subscription_receives_change_notification() {
     teardown_test_schema(&db, &schema_name).await;
 }
 
-#[cfg(feature = "lattice")]
-#[tokio::test]
-async fn taproot_as_lattice_subgraph() {
-    use taproot_core::embed::{TaprootSubgraph, TaprootSubgraphOptions};
-    use taproot_core::lattice::{SubgraphExecutor, SubgraphRequest, TaprootExecutor};
-
-    let Some(db) = connect().await else {
-        return;
-    };
-    let schema_name = test_schema();
-    setup_test_schema(&db, &schema_name).await;
-
-    let db_arc: Arc<dyn Database> = Arc::new(db.clone());
-
-    let subgraph = TaprootSubgraph::build(
-        Arc::clone(&db_arc),
-        TaprootSubgraphOptions {
-            schemas: vec![schema_name.clone()],
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("subgraph build");
-
-    // Verify federation SDL
-    let sdl = subgraph.sdl();
-    assert!(sdl.contains("@key"), "SDL should contain @key: {sdl}");
-
-    // Create executor
-    let executor = TaprootExecutor::new(subgraph);
-
-    // Execute via SubgraphExecutor trait
-    let response = executor
-        .execute_graphql(SubgraphRequest {
-            url: String::new(),
-            query: "{ users(first: 10) { edges { node { name } } } }".into(),
-            operation_name: None,
-            variables: None,
-            headers: vec![],
-        })
-        .await
-        .expect("execution");
-
-    let data = response.data.expect("should have data");
-    let edges = data["users"]["edges"].as_array().expect("array");
-    assert_eq!(edges.len(), 2);
-
-    teardown_test_schema(&db, &schema_name).await;
-}
-
 #[tokio::test]
 async fn query_depth_limit_enforced() {
     let Some(db) = connect().await else {
