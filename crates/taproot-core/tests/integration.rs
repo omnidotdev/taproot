@@ -4022,3 +4022,56 @@ async fn connection_respects_field_selection() {
     assert_eq!(d["users"]["aggregates"]["count"], 2);
     assert_eq!(d["users"]["nodes"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn mutation_variants_by_id_and_unique() {
+    let Some(db) = connect().await else {
+        return;
+    };
+
+    let schema_name = test_schema();
+    setup_test_schema(&db, &schema_name).await;
+    let gql_schema = build_test_schema(&db, &schema_name).await;
+
+    // Grab Alice's global id
+    let listed = gql_schema
+        .execute(r#"{ users(condition: { email: "alice@example.com" }) { nodes { id } } }"#)
+        .await;
+    assert!(listed.errors.is_empty(), "list errors: {:?}", listed.errors);
+    let data = listed.data.into_json().expect("serialize");
+    let alice_id = data["users"]["nodes"][0]["id"].as_str().expect("id").to_string();
+
+    // updateUserById (by global id)
+    let m = format!(
+        "mutation {{ updateUserById(input: {{ id: \"{alice_id}\", patch: {{ name: \"Alice II\" }} }}) {{ user {{ name }} }} }}"
+    );
+    let r = gql_schema.execute(&m).await;
+    assert!(r.errors.is_empty(), "updateById errors: {:?}", r.errors);
+    assert_eq!(r.data.into_json().unwrap()["updateUserById"]["user"]["name"], "Alice II");
+
+    // updateUserByEmail (by unique constraint)
+    let r = gql_schema
+        .execute(r#"mutation { updateUserByEmail(input: { email: "bob@example.com", patch: { name: "Bob II" } }) { user { name } } }"#)
+        .await;
+    assert!(r.errors.is_empty(), "updateByEmail errors: {:?}", r.errors);
+    assert_eq!(r.data.into_json().unwrap()["updateUserByEmail"]["user"]["name"], "Bob II");
+
+    // Create a dependency-free user, then delete it by global id and confirm
+    // the payload echoes back `deletedUserId`
+    let created = gql_schema
+        .execute(r#"mutation { createUser(input: { user: { name: "Temp", email: "temp@example.com" } }) { user { id } } }"#)
+        .await;
+    assert!(created.errors.is_empty(), "create errors: {:?}", created.errors);
+    let temp_id = created.data.into_json().unwrap()["createUser"]["user"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let m = format!("mutation {{ deleteUserById(input: {{ id: \"{temp_id}\" }}) {{ deletedUserId user {{ name }} }} }}");
+    let r = gql_schema.execute(&m).await;
+    teardown_test_schema(&db, &schema_name).await;
+    assert!(r.errors.is_empty(), "deleteById errors: {:?}", r.errors);
+    let d = r.data.into_json().unwrap();
+    assert_eq!(d["deleteUserById"]["deletedUserId"], temp_id);
+    assert_eq!(d["deleteUserById"]["user"]["name"], "Temp");
+}

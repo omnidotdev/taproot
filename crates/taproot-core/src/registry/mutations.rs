@@ -225,33 +225,55 @@ pub fn build_create_input(type_name: &str, table_field_name: &str) -> InputObjec
         ))
 }
 
-/// Build an `Update{Type}Input` with PK field(s) required and a `patch` field.
+/// Build an update input keyed on the given columns, named `input_name`, with a
+/// required `patch`. Used for the by-primary-key and by-unique-constraint
+/// update mutations.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn build_update_input(
-    _table: &TableInfo,
+    input_name: &str,
     type_name: &str,
-    pk_cols: &[ColumnInfo],
+    key_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
-    let input_name = format!("Update{type_name}Input");
     let patch_type_name = format!("{type_name}Patch");
-    let mut input = InputObject::new(&input_name);
+    let mut input = InputObject::new(input_name);
 
     input = input.field(InputValue::new(
         "clientMutationId",
         TypeRef::named(TypeRef::STRING),
     ));
 
-    // All PK fields are required
-    for pk_col in pk_cols {
-        let pk_field_name = crate::introspect::column_field_name(&pk_col.name);
-        let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
-        input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    // All key fields are required
+    for key_col in key_cols {
+        let field_name = crate::introspect::column_field_name(&key_col.name);
+        let (gql_type, _) = resolve_column_type_for_input(key_col, enum_names);
+        input = input.field(InputValue::new(field_name, TypeRef::named_nn(gql_type)));
     }
 
     // Patch field
     input = input.field(InputValue::new("patch", TypeRef::named_nn(&patch_type_name)));
+
+    input
+}
+
+/// Build an update/delete input keyed on the global `id`, named `input_name`.
+/// When `with_patch` is set a required `patch` is added (for updates).
+#[must_use]
+pub fn build_node_id_input(input_name: &str, type_name: &str, with_patch: bool) -> InputObject {
+    let mut input = InputObject::new(input_name)
+        .field(InputValue::new(
+            "clientMutationId",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)));
+
+    if with_patch {
+        input = input.field(InputValue::new(
+            "patch",
+            TypeRef::named_nn(format!("{type_name}Patch")),
+        ));
+    }
 
     input
 }
@@ -284,27 +306,26 @@ pub fn build_update_patch(
     patch
 }
 
-/// Build a `Delete{Type}Input` with PK field(s).
+/// Build a delete input keyed on the given columns, named `input_name`. Used
+/// for the by-primary-key and by-unique-constraint delete mutations.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn build_delete_input(
-    _table: &TableInfo,
-    type_name: &str,
-    pk_cols: &[ColumnInfo],
+    input_name: &str,
+    key_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
-    let input_name = format!("Delete{type_name}Input");
-    let mut input = InputObject::new(&input_name);
+    let mut input = InputObject::new(input_name);
 
     input = input.field(InputValue::new(
         "clientMutationId",
         TypeRef::named(TypeRef::STRING),
     ));
 
-    for pk_col in pk_cols {
-        let pk_field_name = crate::introspect::column_field_name(&pk_col.name);
-        let (gql_type, _) = resolve_column_type_for_input(pk_col, enum_names);
-        input = input.field(InputValue::new(pk_field_name, TypeRef::named_nn(gql_type)));
+    for key_col in key_cols {
+        let field_name = crate::introspect::column_field_name(&key_col.name);
+        let (gql_type, _) = resolve_column_type_for_input(key_col, enum_names);
+        input = input.field(InputValue::new(field_name, TypeRef::named_nn(gql_type)));
     }
 
     input
