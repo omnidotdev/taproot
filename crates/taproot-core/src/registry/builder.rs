@@ -177,7 +177,7 @@ pub fn build_schema(
     }
 
     // Register all custom scalars upfront (condition types reference them)
-    for scalar_name in &["UUID", "DateTime", "Date", "JSON", "BigInt", "BigDecimal"] {
+    for scalar_name in &["UUID", "Datetime", "Date", "JSON", "BigInt", "BigDecimal", "Cursor"] {
         schema_builder = schema_builder.register(Scalar::new(*scalar_name));
     }
 
@@ -197,7 +197,7 @@ pub fn build_schema(
     // Register the Relay Node interface; every table type with a primary key
     // implements it and exposes a global `nodeId`
     schema_builder = schema_builder.register(
-        Interface::new("Node").field(InterfaceField::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+        Interface::new("Node").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID))),
     );
 
     // Map GraphQL type name -> how to refetch one of its rows, for `node()`
@@ -470,7 +470,7 @@ pub fn build_schema(
                 let node_registry = Arc::clone(&node_registry);
                 let node_db = Arc::clone(&node_db);
                 FieldFuture::new(async move {
-                    let node_id = ctx.args.try_get("nodeId")?.string()?.to_string();
+                    let node_id = ctx.args.try_get("id")?.string()?.to_string();
                     let (type_name, pk_values) = decode_node_id(&node_id)
                         .map_err(|e| async_graphql::Error::new(format!("invalid nodeId: {e}")))?;
 
@@ -536,7 +536,7 @@ pub fn build_schema(
                         .map(|row| row_json_to_field_value(&row).with_type(type_name.clone())))
                 })
             })
-            .argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+            .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
         );
     }
 
@@ -558,7 +558,7 @@ pub fn build_schema(
     // constant global id
     query = query
         .field(Field::new(
-            "nodeId",
+            "id",
             TypeRef::named_nn(TypeRef::ID),
             |_ctx| {
                 FieldFuture::new(async {
@@ -786,9 +786,40 @@ pub fn build_schema(
 /// Build a `GraphQL` object type from a table's columns, including relationship
 /// fields derived from foreign keys.
 ///
-/// Belongs-to fields are added for FKs on this table (e.g. `userByAuthorId`).
+/// Forward (belongs-to) relation field name, following Postgraphile's
+/// simplified inflection: a single-column foreign key named `<x>_id` becomes
+/// `<x>` (e.g. `author_id` -> `author`), and anything else keeps the
+/// disambiguated `<foreignTable>By<Column>` form.
+fn belongs_to_field_name(fk_column: &str, foreign_table: &str) -> String {
+    fk_column.strip_suffix("_id").map_or_else(
+        || {
+            format!(
+                "{}By{}",
+                to_camel_case(&singularize(foreign_table)),
+                to_pascal_case(fk_column),
+            )
+        },
+        to_camel_case,
+    )
+}
+
+/// Backward (has-many) relation field name, following Postgraphile's simplified
+/// inflection: when the child foreign-key column is `<thisTable>_id` the
+/// relation collapses to the pluralized child name (e.g. `post.post_id` on
+/// `comment` -> `comments`); otherwise the disambiguated `<plural>By<Column>`
+/// form is kept (e.g. `post.author_id` -> `postsByAuthorId`).
+fn has_many_field_name(child_table: &str, fk_column: &str, this_table: &str) -> String {
+    let plural = pluralize(&to_camel_case(&singularize(child_table)));
+    if fk_column == format!("{}_id", singularize(this_table)) {
+        plural
+    } else {
+        format!("{plural}By{}", to_pascal_case(fk_column))
+    }
+}
+
+/// Belongs-to fields are added for FKs on this table (e.g. `author`).
 /// Has-many fields are added for FKs on other tables pointing here (e.g.
-/// `postsByAuthorId`).
+/// `comments` or `postsByAuthorId`).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn build_object_type(
     type_name: &str,
@@ -852,11 +883,7 @@ fn build_object_type(
         }
 
         let foreign_type_name = to_pascal_case(&singularize(&fk.foreign_table));
-        let field_name = format!(
-            "{}By{}",
-            to_camel_case(&singularize(&fk.foreign_table)),
-            to_pascal_case(&fk.columns[0]),
-        );
+        let field_name = belongs_to_field_name(&fk.columns[0], &fk.foreign_table);
 
         let fk_col_name = fk.columns[0].clone();
         let foreign_schema = fk.foreign_schema.clone();
@@ -926,11 +953,8 @@ fn build_object_type(
 
             let child_type_name = to_pascal_case(&singularize(&child_table.name));
             let connection_type_name = format!("{child_type_name}Connection");
-            let field_name = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&child_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let field_name =
+                has_many_field_name(&child_table.name, &fk.columns[0], &table.name);
 
             let child_schema = child_table.schema.clone();
             let child_table_name = child_table.name.clone();
@@ -1067,9 +1091,9 @@ fn build_object_type(
                 },
             )
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("after", TypeRef::named("Cursor")))
             .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("before", TypeRef::named("Cursor")))
             .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
             object = object.field(field);
@@ -1108,7 +1132,7 @@ fn build_object_type(
     if let Some(pk) = &table.primary_key {
         let pk_columns = pk.columns.clone();
         let node_type_name = type_name.to_string();
-        let node_field = Field::new("nodeId", TypeRef::named_nn(TypeRef::ID), move |ctx| {
+        let node_field = Field::new("id", TypeRef::named_nn(TypeRef::ID), move |ctx| {
             let pk_columns = pk_columns.clone();
             let node_type_name = node_type_name.clone();
             FieldFuture::new(async move {
@@ -1443,9 +1467,9 @@ fn build_custom_function_query(
         // Add pagination arguments
         field = field
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("after", TypeRef::named("Cursor")))
             .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("before", TypeRef::named("Cursor")))
             .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
         field
@@ -1817,11 +1841,8 @@ fn selected_laterals(
             }
 
             // GraphQL field name for this has-many relation on the node type
-            let rel_field = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&child_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let rel_field =
+                has_many_field_name(&child_table.name, &fk.columns[0], &parent_table.name);
 
             // Which node selection sets actually asked for this relation?
             let rel_las: Vec<async_graphql::Lookahead<'_>> = node_las
@@ -2060,9 +2081,9 @@ fn build_list_query(
         TypeRef::named_nn_list(&order_by_type_name),
     ))
     .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("after", TypeRef::named("Cursor")))
     .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-    .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("before", TypeRef::named("Cursor")))
     .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
 }
 
@@ -2303,11 +2324,7 @@ fn build_nested_rel_inputs(
         };
 
         let related_type = to_pascal_case(&singularize(&fk.foreign_table));
-        let rel_field_name = format!(
-            "{}By{}",
-            to_camel_case(&singularize(&fk.foreign_table)),
-            to_pascal_case(&fk.columns[0]),
-        );
+        let rel_field_name = belongs_to_field_name(&fk.columns[0], &fk.foreign_table);
         let pascal_rel_field = format!(
             "{}By{}",
             to_pascal_case(&singularize(&fk.foreign_table)),
@@ -2403,11 +2420,8 @@ fn build_nested_rel_inputs(
             // Mirror the read-side has-many relation naming: pluralize the
             // singular form so an already-plural table name is not doubled
             // (e.g. `posts` -> `postsByAuthorId`, not `postsesByAuthorId`)
-            let rel_field_name = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&other_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let rel_field_name =
+                has_many_field_name(&other_table.name, &fk.columns[0], &table.name);
             let pascal_rel_field = format!(
                 "{}By{}",
                 to_pascal_case(&pluralize(&singularize(&other_table.name))),
@@ -2443,7 +2457,11 @@ fn build_nested_rel_inputs(
 
 /// Register all mutation input types, payload types, and mutation fields
 /// for a single table.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
 fn register_mutation_types(
     mut schema_builder: async_graphql::dynamic::SchemaBuilder,
     mut mutation: Object,
@@ -2518,9 +2536,55 @@ fn register_mutation_types(
         mutation = mutation.field(build_bulk_create_mutation(table, type_name, &plural_field_name, db));
     }
 
+    // Key mappings shared by the primary-key and node-id mutation variants
+    let pk_mappings: Vec<(String, String)> = pk_cols
+        .iter()
+        .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
+        .collect();
+    let pk_col_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
+
+    // Unique constraints that are not the primary key, each resolved to its
+    // columns, a PascalCase name suffix, and (input field, column) mappings
+    let unique_variants: Vec<(String, Vec<ColumnInfo>, Vec<(String, String)>)> = table
+        .unique_constraints
+        .iter()
+        .filter(|uc| {
+            table
+                .primary_key
+                .as_ref()
+                .is_none_or(|pk| pk.columns != uc.columns)
+        })
+        .filter_map(|uc| {
+            let cols: Vec<ColumnInfo> = uc
+                .columns
+                .iter()
+                .filter_map(|name| table.columns.iter().find(|c| &c.name == name).cloned())
+                .collect();
+            if cols.len() != uc.columns.len() {
+                return None;
+            }
+            let suffix = uc
+                .columns
+                .iter()
+                .map(|c| to_pascal_case(c))
+                .collect::<Vec<_>>()
+                .join("And");
+            let mappings: Vec<(String, String)> = cols
+                .iter()
+                .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
+                .collect();
+            Some((suffix, cols, mappings))
+        })
+        .collect();
+
     if !omit_update {
-        schema_builder = schema_builder
-            .register(mutations::build_update_input(table, type_name, pk_cols, enum_names));
+        let input_name = format!("Update{type_name}Input");
+        schema_builder = schema_builder.register(mutations::build_update_input(
+            &input_name,
+            type_name,
+            pk_cols,
+            enum_names,
+        ));
         schema_builder = schema_builder
             .register(mutations::build_update_patch(table, type_name, pk_cols, enum_names));
         schema_builder = schema_builder.register(build_mutation_payload(
@@ -2528,8 +2592,45 @@ fn register_mutation_types(
             table_field_name,
             type_name,
         ));
-        mutation =
-            mutation.field(build_update_mutation(table, type_name, table_field_name, pk_cols, db));
+        mutation = mutation.field(build_update_mutation(
+            table,
+            type_name,
+            table_field_name,
+            &format!("update{type_name}"),
+            &input_name,
+            &pk_mappings,
+            db,
+        ));
+
+        // By global node id: update{Type}ById
+        let by_id_input = format!("Update{type_name}ByIdInput");
+        schema_builder = schema_builder
+            .register(mutations::build_node_id_input(&by_id_input, type_name, true));
+        mutation = mutation.field(build_node_id_update_mutation(
+            table,
+            type_name,
+            table_field_name,
+            &pk_col_names,
+            db,
+        ));
+
+        // By each unique constraint: update{Type}By{Cols}
+        for (suffix, cols, mappings) in &unique_variants {
+            let field = format!("update{type_name}By{suffix}");
+            let input = format!("Update{type_name}By{suffix}Input");
+            schema_builder = schema_builder.register(mutations::build_update_input(
+                &input, type_name, cols, enum_names,
+            ));
+            mutation = mutation.field(build_update_mutation(
+                table,
+                type_name,
+                table_field_name,
+                &field,
+                &input,
+                mappings,
+                db,
+            ));
+        }
 
         // Bulk update
         schema_builder = schema_builder
@@ -2543,15 +2644,51 @@ fn register_mutation_types(
     }
 
     if !omit_delete {
+        let input_name = format!("Delete{type_name}Input");
         schema_builder = schema_builder
-            .register(mutations::build_delete_input(table, type_name, pk_cols, enum_names));
-        schema_builder = schema_builder.register(build_mutation_payload(
-            &format!("Delete{type_name}"),
-            table_field_name,
+            .register(mutations::build_delete_input(&input_name, pk_cols, enum_names));
+        schema_builder =
+            schema_builder.register(build_delete_payload(table_field_name, type_name));
+        mutation = mutation.field(build_delete_mutation(
+            table,
             type_name,
+            table_field_name,
+            &format!("delete{type_name}"),
+            &input_name,
+            &pk_mappings,
+            &pk_col_names,
+            db,
         ));
-        mutation =
-            mutation.field(build_delete_mutation(table, type_name, table_field_name, pk_cols, db));
+
+        // By global node id: delete{Type}ById
+        let by_id_input = format!("Delete{type_name}ByIdInput");
+        schema_builder = schema_builder
+            .register(mutations::build_node_id_input(&by_id_input, type_name, false));
+        mutation = mutation.field(build_node_id_delete_mutation(
+            table,
+            type_name,
+            table_field_name,
+            &pk_col_names,
+            db,
+        ));
+
+        // By each unique constraint: delete{Type}By{Cols}
+        for (suffix, cols, mappings) in &unique_variants {
+            let field = format!("delete{type_name}By{suffix}");
+            let input = format!("Delete{type_name}By{suffix}Input");
+            schema_builder = schema_builder
+                .register(mutations::build_delete_input(&input, cols, enum_names));
+            mutation = mutation.field(build_delete_mutation(
+                table,
+                type_name,
+                table_field_name,
+                &field,
+                &input,
+                mappings,
+                &pk_col_names,
+                db,
+            ));
+        }
 
         // Bulk delete
         schema_builder = schema_builder
@@ -2626,6 +2763,26 @@ fn build_mutation_payload(
     }));
 
     payload
+}
+
+/// Build a delete payload: a mutation payload plus `deleted<Type>Id`, the
+/// global id of the row that was removed (Postgraphile parity).
+fn build_delete_payload(table_field_name: &str, type_name: &str) -> Object {
+    let deleted_id_key = format!("deleted{type_name}Id");
+    let key_for_resolver = deleted_id_key.clone();
+    build_mutation_payload(&format!("Delete{type_name}"), table_field_name, type_name).field(
+        Field::new(&deleted_id_key, TypeRef::named(TypeRef::ID), move |ctx| {
+            let key = key_for_resolver.clone();
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_to_value()?;
+                if let async_graphql::Value::Object(map) = parent {
+                    Ok(map.get(key.as_str()).cloned().map(FieldValue::value))
+                } else {
+                    Ok(None)
+                }
+            })
+        }),
+    )
 }
 
 /// Build a bulk mutation payload object type with `clientMutationId`,
@@ -3252,21 +3409,20 @@ fn build_update_mutation(
     table: &TableInfo,
     type_name: &str,
     table_field_name: &str,
-    pk_cols: &[ColumnInfo],
+    field_name: &str,
+    input_type_name: &str,
+    key_mappings: &[(String, String)],
     db: &Arc<dyn Database>,
 ) -> Field {
-    let field_name = format!("update{type_name}");
-    let input_type_name = format!("Update{type_name}Input");
+    let field_name = field_name.to_string();
+    let input_type_name = input_type_name.to_string();
     let payload_type_name = format!("Update{type_name}Payload");
 
     let schema_name = table.schema.clone();
     let table_info = table.clone();
     let table_field = table_field_name.to_string();
-    // Store (camelCase field name, snake_case column name) pairs
-    let pk_mappings: Vec<(String, String)> = pk_cols
-        .iter()
-        .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
-        .collect();
+    // (camelCase input field name, snake_case column name) pairs for the key
+    let pk_mappings: Vec<(String, String)> = key_mappings.to_vec();
     let db = Arc::clone(db);
 
     Field::new(
@@ -3338,24 +3494,28 @@ fn build_update_mutation(
 }
 
 /// Build a `delete{Type}` mutation field.
+#[allow(clippy::too_many_arguments)]
 fn build_delete_mutation(
     table: &TableInfo,
     type_name: &str,
     table_field_name: &str,
-    pk_cols: &[ColumnInfo],
+    field_name: &str,
+    input_type_name: &str,
+    key_mappings: &[(String, String)],
+    pk_col_names: &[String],
     db: &Arc<dyn Database>,
 ) -> Field {
-    let field_name = format!("delete{type_name}");
-    let input_type_name = format!("Delete{type_name}Input");
+    let field_name = field_name.to_string();
+    let input_type_name = input_type_name.to_string();
     let payload_type_name = format!("Delete{type_name}Payload");
+    let deleted_id_key = format!("deleted{type_name}Id");
+    let node_type = type_name.to_string();
 
     let schema_name = table.schema.clone();
     let table_info = table.clone();
     let table_field = table_field_name.to_string();
-    let pk_mappings: Vec<(String, String)> = pk_cols
-        .iter()
-        .map(|c| (crate::introspect::column_field_name(&c.name), c.name.clone()))
-        .collect();
+    let pk_mappings: Vec<(String, String)> = key_mappings.to_vec();
+    let pk_col_names = pk_col_names.to_vec();
     let db = Arc::clone(db);
 
     Field::new(
@@ -3367,6 +3527,9 @@ fn build_delete_mutation(
             let table_info = table_info.clone();
             let table_field = table_field.clone();
             let pk_mappings = pk_mappings.clone();
+            let deleted_id_key = deleted_id_key.clone();
+            let node_type = node_type.clone();
+            let pk_col_names = pk_col_names.clone();
 
             FieldFuture::new(async move {
                 let rls = ctx.data::<RlsContext>().ok();
@@ -3407,8 +3570,22 @@ fn build_delete_mutation(
                     })
                     .unwrap_or(serde_json::Value::Null);
 
+                // Encode the deleted row's global id for `deleted<Type>Id`
+                let deleted_id = if row.is_null() {
+                    serde_json::Value::Null
+                } else {
+                    let pk_values: Vec<serde_json::Value> = pk_col_names
+                        .iter()
+                        .map(|c| {
+                            row.get(c.as_str()).cloned().unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect();
+                    serde_json::Value::String(encode_node_id(&node_type, &pk_values))
+                };
+
                 let mut payload = serde_json::Map::new();
                 payload.insert("clientMutationId".to_string(), client_mutation_id);
+                payload.insert(deleted_id_key, deleted_id);
                 payload.insert(table_field, row);
 
                 Ok(Some(FieldValue::value(serde_json_to_gql_value(
@@ -3417,6 +3594,136 @@ fn build_delete_mutation(
             })
         },
     )
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build an `update{Type}ById` mutation keyed on the global node `id`.
+fn build_node_id_update_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    pk_col_names: &[String],
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = format!("update{type_name}ById");
+    let input_type_name = format!("Update{type_name}ByIdInput");
+    let payload_type_name = format!("Update{type_name}Payload");
+    let node_type = type_name.to_string();
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let table_field = table_field_name.to_string();
+    let pk_col_names = pk_col_names.to_vec();
+    let db = Arc::clone(db);
+
+    Field::new(&field_name, TypeRef::named(&payload_type_name), move |ctx| {
+        let db = Arc::clone(&db);
+        let schema_name = schema_name.clone();
+        let table_info = table_info.clone();
+        let table_field = table_field.clone();
+        let pk_col_names = pk_col_names.clone();
+        let node_type = node_type.clone();
+        FieldFuture::new(async move {
+            let rls = ctx.data::<RlsContext>().ok();
+            let input_json = gql_value_to_json(ctx.args.try_get("input")?.as_value());
+            let client_mutation_id = input_json
+                .get("clientMutationId")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let global_id = input_json.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let (decoded_type, pk_values) = decode_node_id(global_id)
+                .map_err(|e| async_graphql::Error::new(format!("invalid id: {e}")))?;
+            if decoded_type != node_type || pk_values.len() != pk_col_names.len() {
+                return Err(async_graphql::Error::new("invalid id for this type"));
+            }
+            let pk_columns: Vec<(String, serde_json::Value)> =
+                pk_col_names.iter().cloned().zip(pk_values).collect();
+            let patch = input_json.get("patch").cloned().unwrap_or(serde_json::Value::Null);
+            let (sql, params) =
+                mutations::update_to_sql(&pk_columns, &patch, &table_info, &schema_name);
+            let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                async_graphql::Error::new(format!("database error: {e}"))
+            })?;
+            let row = rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                .unwrap_or(serde_json::Value::Null);
+            let mut payload = serde_json::Map::new();
+            payload.insert("clientMutationId".to_string(), client_mutation_id);
+            payload.insert(table_field, row);
+            Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                &serde_json::Value::Object(payload),
+            ))))
+        })
+    })
+    .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
+}
+
+/// Build a `delete{Type}ById` mutation keyed on the global node `id`.
+fn build_node_id_delete_mutation(
+    table: &TableInfo,
+    type_name: &str,
+    table_field_name: &str,
+    pk_col_names: &[String],
+    db: &Arc<dyn Database>,
+) -> Field {
+    let field_name = format!("delete{type_name}ById");
+    let input_type_name = format!("Delete{type_name}ByIdInput");
+    let payload_type_name = format!("Delete{type_name}Payload");
+    let deleted_id_key = format!("deleted{type_name}Id");
+    let node_type = type_name.to_string();
+    let schema_name = table.schema.clone();
+    let table_info = table.clone();
+    let table_field = table_field_name.to_string();
+    let pk_col_names = pk_col_names.to_vec();
+    let db = Arc::clone(db);
+
+    Field::new(&field_name, TypeRef::named(&payload_type_name), move |ctx| {
+        let db = Arc::clone(&db);
+        let schema_name = schema_name.clone();
+        let table_info = table_info.clone();
+        let table_field = table_field.clone();
+        let pk_col_names = pk_col_names.clone();
+        let node_type = node_type.clone();
+        let deleted_id_key = deleted_id_key.clone();
+        FieldFuture::new(async move {
+            let rls = ctx.data::<RlsContext>().ok();
+            let input_json = gql_value_to_json(ctx.args.try_get("input")?.as_value());
+            let client_mutation_id = input_json
+                .get("clientMutationId")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let global_id = input_json.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let (decoded_type, pk_values) = decode_node_id(global_id)
+                .map_err(|e| async_graphql::Error::new(format!("invalid id: {e}")))?;
+            if decoded_type != node_type || pk_values.len() != pk_col_names.len() {
+                return Err(async_graphql::Error::new("invalid id for this type"));
+            }
+            let pk_columns: Vec<(String, serde_json::Value)> =
+                pk_col_names.iter().cloned().zip(pk_values).collect();
+            let (sql, params) = mutations::delete_to_sql(&pk_columns, &table_info, &schema_name);
+            let rows = db.query_with_rls(&sql, &params, rls).await.map_err(|e| {
+                async_graphql::Error::new(format!("database error: {e}"))
+            })?;
+            let row = rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.get("row_to_json").cloned().or(Some(r)))
+                .unwrap_or(serde_json::Value::Null);
+            let deleted_id = if row.is_null() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(global_id.to_string())
+            };
+            let mut payload = serde_json::Map::new();
+            payload.insert("clientMutationId".to_string(), client_mutation_id);
+            payload.insert(deleted_id_key, deleted_id);
+            payload.insert(table_field, row);
+            Ok(Some(FieldValue::value(serde_json_to_gql_value(
+                &serde_json::Value::Object(payload),
+            ))))
+        })
+    })
     .argument(InputValue::new("input", TypeRef::named_nn(&input_type_name)))
 }
 

@@ -138,7 +138,7 @@ pub fn build_page_info_type() -> Object {
         ))
         .field(Field::new(
             "startCursor",
-            TypeRef::named(TypeRef::STRING),
+            TypeRef::named("Cursor"),
             |ctx| {
                 FieldFuture::new(async move {
                     let parent = ctx.parent_value.try_to_value()?;
@@ -153,7 +153,7 @@ pub fn build_page_info_type() -> Object {
         ))
         .field(Field::new(
             "endCursor",
-            TypeRef::named(TypeRef::STRING),
+            TypeRef::named("Cursor"),
             |ctx| {
                 FieldFuture::new(async move {
                     let parent = ctx.parent_value.try_to_value()?;
@@ -245,7 +245,7 @@ pub fn build_edge_type(type_name: &str) -> Object {
         }))
         .field(Field::new(
             "cursor",
-            TypeRef::named_nn(TypeRef::STRING),
+            TypeRef::named_nn("Cursor"),
             |ctx| {
                 FieldFuture::new(async move {
                     let parent = ctx.parent_value.try_to_value()?;

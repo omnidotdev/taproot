@@ -55,8 +55,8 @@ const SCALAR_CONDITIONS: &[ScalarConditionDef] = &[
         has_pattern: false,
     },
     ScalarConditionDef {
-        scalar: "DateTime",
-        type_name: "DateTimeCondition",
+        scalar: "Datetime",
+        type_name: "DatetimeCondition",
         has_ordering: true,
         has_pattern: false,
     },

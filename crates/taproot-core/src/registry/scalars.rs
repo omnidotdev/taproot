@@ -25,7 +25,7 @@ pub fn map_udt_to_graphql(udt_name: &str) -> (&'static str, bool) {
         "bool" | "boolean" => "Boolean",
         "uuid" => "UUID",
         "timestamptz" | "timestamp" | "timestamp with time zone"
-        | "timestamp without time zone" => "DateTime",
+        | "timestamp without time zone" => "Datetime",
         "date" => "Date",
         "json" | "jsonb" => "JSON",
         "numeric" | "decimal" => "BigDecimal",
@@ -41,7 +41,7 @@ pub fn map_udt_to_graphql(udt_name: &str) -> (&'static str, bool) {
 pub fn needs_custom_scalar(graphql_type: &str) -> Option<&'static str> {
     match graphql_type {
         "UUID" => Some("UUID"),
-        "DateTime" => Some("DateTime"),
+        "Datetime" => Some("Datetime"),
         "Date" => Some("Date"),
         "JSON" => Some("JSON"),
         "BigInt" => Some("BigInt"),
@@ -63,7 +63,7 @@ mod tests {
         assert_eq!(map_udt_to_graphql("float8"), ("Float", false));
         assert_eq!(map_udt_to_graphql("bool"), ("Boolean", false));
         assert_eq!(map_udt_to_graphql("uuid"), ("UUID", false));
-        assert_eq!(map_udt_to_graphql("timestamptz"), ("DateTime", false));
+        assert_eq!(map_udt_to_graphql("timestamptz"), ("Datetime", false));
         assert_eq!(map_udt_to_graphql("date"), ("Date", false));
         assert_eq!(map_udt_to_graphql("jsonb"), ("JSON", false));
         assert_eq!(map_udt_to_graphql("numeric"), ("BigDecimal", false));
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn custom_scalar_detection() {
         assert_eq!(needs_custom_scalar("UUID"), Some("UUID"));
-        assert_eq!(needs_custom_scalar("DateTime"), Some("DateTime"));
+        assert_eq!(needs_custom_scalar("Datetime"), Some("Datetime"));
         assert_eq!(needs_custom_scalar("String"), None);
         assert_eq!(needs_custom_scalar("Int"), None);
         assert_eq!(needs_custom_scalar("Boolean"), None);
