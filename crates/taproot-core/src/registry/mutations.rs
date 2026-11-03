@@ -235,7 +235,7 @@ pub fn build_update_input(
     enum_names: &HashSet<String>,
 ) -> InputObject {
     let input_name = format!("Update{type_name}Input");
-    let patch_type_name = format!("Update{type_name}Patch");
+    let patch_type_name = format!("{type_name}Patch");
     let mut input = InputObject::new(&input_name);
 
     input = input.field(InputValue::new(
@@ -265,7 +265,7 @@ pub fn build_update_patch(
     pk_cols: &[ColumnInfo],
     enum_names: &HashSet<String>,
 ) -> InputObject {
-    let patch_name = format!("Update{type_name}Patch");
+    let patch_name = format!("{type_name}Patch");
     let mut patch = InputObject::new(&patch_name);
 
     let pk_names: HashSet<&str> = pk_cols.iter().map(|c| c.name.as_str()).collect();
@@ -556,7 +556,7 @@ pub fn build_bulk_create_input(type_name: &str, plural_type_name: &str) -> Input
 pub fn build_bulk_update_input(type_name: &str, plural_type_name: &str) -> InputObject {
     let input_name = format!("Update{plural_type_name}BulkInput");
     let filter_type = format!("{type_name}Filter");
-    let patch_type = format!("Update{type_name}Patch");
+    let patch_type = format!("{type_name}Patch");
     let mut input = InputObject::new(&input_name);
 
     input = input.field(InputValue::new(
