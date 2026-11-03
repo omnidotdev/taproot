@@ -2773,12 +2773,12 @@ dependencies = [
 
 [[package]]
 name = "taproot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-graphql",
  "async-stream",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bigdecimal",
  "chrono",
  "futures-util",
@@ -2793,13 +2793,13 @@ dependencies = [
 
 [[package]]
 name = "taproot-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",
  "async-graphql-axum",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "jsonwebtoken",
  "reqwest",
