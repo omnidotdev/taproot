@@ -177,7 +177,7 @@ pub fn build_schema(
     }
 
     // Register all custom scalars upfront (condition types reference them)
-    for scalar_name in &["UUID", "DateTime", "Date", "JSON", "BigInt", "BigDecimal"] {
+    for scalar_name in &["UUID", "Datetime", "Date", "JSON", "BigInt", "BigDecimal", "Cursor"] {
         schema_builder = schema_builder.register(Scalar::new(*scalar_name));
     }
 
@@ -197,7 +197,7 @@ pub fn build_schema(
     // Register the Relay Node interface; every table type with a primary key
     // implements it and exposes a global `nodeId`
     schema_builder = schema_builder.register(
-        Interface::new("Node").field(InterfaceField::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+        Interface::new("Node").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID))),
     );
 
     // Map GraphQL type name -> how to refetch one of its rows, for `node()`
@@ -470,7 +470,7 @@ pub fn build_schema(
                 let node_registry = Arc::clone(&node_registry);
                 let node_db = Arc::clone(&node_db);
                 FieldFuture::new(async move {
-                    let node_id = ctx.args.try_get("nodeId")?.string()?.to_string();
+                    let node_id = ctx.args.try_get("id")?.string()?.to_string();
                     let (type_name, pk_values) = decode_node_id(&node_id)
                         .map_err(|e| async_graphql::Error::new(format!("invalid nodeId: {e}")))?;
 
@@ -536,7 +536,7 @@ pub fn build_schema(
                         .map(|row| row_json_to_field_value(&row).with_type(type_name.clone())))
                 })
             })
-            .argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+            .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
         );
     }
 
@@ -558,7 +558,7 @@ pub fn build_schema(
     // constant global id
     query = query
         .field(Field::new(
-            "nodeId",
+            "id",
             TypeRef::named_nn(TypeRef::ID),
             |_ctx| {
                 FieldFuture::new(async {
@@ -786,9 +786,40 @@ pub fn build_schema(
 /// Build a `GraphQL` object type from a table's columns, including relationship
 /// fields derived from foreign keys.
 ///
-/// Belongs-to fields are added for FKs on this table (e.g. `userByAuthorId`).
+/// Forward (belongs-to) relation field name, following Postgraphile's
+/// simplified inflection: a single-column foreign key named `<x>_id` becomes
+/// `<x>` (e.g. `author_id` -> `author`), and anything else keeps the
+/// disambiguated `<foreignTable>By<Column>` form.
+fn belongs_to_field_name(fk_column: &str, foreign_table: &str) -> String {
+    fk_column.strip_suffix("_id").map_or_else(
+        || {
+            format!(
+                "{}By{}",
+                to_camel_case(&singularize(foreign_table)),
+                to_pascal_case(fk_column),
+            )
+        },
+        to_camel_case,
+    )
+}
+
+/// Backward (has-many) relation field name, following Postgraphile's simplified
+/// inflection: when the child foreign-key column is `<thisTable>_id` the
+/// relation collapses to the pluralized child name (e.g. `post.post_id` on
+/// `comment` -> `comments`); otherwise the disambiguated `<plural>By<Column>`
+/// form is kept (e.g. `post.author_id` -> `postsByAuthorId`).
+fn has_many_field_name(child_table: &str, fk_column: &str, this_table: &str) -> String {
+    let plural = pluralize(&to_camel_case(&singularize(child_table)));
+    if fk_column == format!("{}_id", singularize(this_table)) {
+        plural
+    } else {
+        format!("{plural}By{}", to_pascal_case(fk_column))
+    }
+}
+
+/// Belongs-to fields are added for FKs on this table (e.g. `author`).
 /// Has-many fields are added for FKs on other tables pointing here (e.g.
-/// `postsByAuthorId`).
+/// `comments` or `postsByAuthorId`).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn build_object_type(
     type_name: &str,
@@ -852,11 +883,7 @@ fn build_object_type(
         }
 
         let foreign_type_name = to_pascal_case(&singularize(&fk.foreign_table));
-        let field_name = format!(
-            "{}By{}",
-            to_camel_case(&singularize(&fk.foreign_table)),
-            to_pascal_case(&fk.columns[0]),
-        );
+        let field_name = belongs_to_field_name(&fk.columns[0], &fk.foreign_table);
 
         let fk_col_name = fk.columns[0].clone();
         let foreign_schema = fk.foreign_schema.clone();
@@ -926,11 +953,8 @@ fn build_object_type(
 
             let child_type_name = to_pascal_case(&singularize(&child_table.name));
             let connection_type_name = format!("{child_type_name}Connection");
-            let field_name = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&child_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let field_name =
+                has_many_field_name(&child_table.name, &fk.columns[0], &table.name);
 
             let child_schema = child_table.schema.clone();
             let child_table_name = child_table.name.clone();
@@ -1067,9 +1091,9 @@ fn build_object_type(
                 },
             )
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("after", TypeRef::named("Cursor")))
             .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("before", TypeRef::named("Cursor")))
             .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
             object = object.field(field);
@@ -1108,7 +1132,7 @@ fn build_object_type(
     if let Some(pk) = &table.primary_key {
         let pk_columns = pk.columns.clone();
         let node_type_name = type_name.to_string();
-        let node_field = Field::new("nodeId", TypeRef::named_nn(TypeRef::ID), move |ctx| {
+        let node_field = Field::new("id", TypeRef::named_nn(TypeRef::ID), move |ctx| {
             let pk_columns = pk_columns.clone();
             let node_type_name = node_type_name.clone();
             FieldFuture::new(async move {
@@ -1443,9 +1467,9 @@ fn build_custom_function_query(
         // Add pagination arguments
         field = field
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("after", TypeRef::named("Cursor")))
             .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+            .argument(InputValue::new("before", TypeRef::named("Cursor")))
             .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)));
 
         field
@@ -1817,11 +1841,8 @@ fn selected_laterals(
             }
 
             // GraphQL field name for this has-many relation on the node type
-            let rel_field = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&child_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let rel_field =
+                has_many_field_name(&child_table.name, &fk.columns[0], &parent_table.name);
 
             // Which node selection sets actually asked for this relation?
             let rel_las: Vec<async_graphql::Lookahead<'_>> = node_las
@@ -2060,9 +2081,9 @@ fn build_list_query(
         TypeRef::named_nn_list(&order_by_type_name),
     ))
     .argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("after", TypeRef::named("Cursor")))
     .argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-    .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("before", TypeRef::named("Cursor")))
     .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
 }
 
@@ -2303,11 +2324,7 @@ fn build_nested_rel_inputs(
         };
 
         let related_type = to_pascal_case(&singularize(&fk.foreign_table));
-        let rel_field_name = format!(
-            "{}By{}",
-            to_camel_case(&singularize(&fk.foreign_table)),
-            to_pascal_case(&fk.columns[0]),
-        );
+        let rel_field_name = belongs_to_field_name(&fk.columns[0], &fk.foreign_table);
         let pascal_rel_field = format!(
             "{}By{}",
             to_pascal_case(&singularize(&fk.foreign_table)),
@@ -2403,11 +2420,8 @@ fn build_nested_rel_inputs(
             // Mirror the read-side has-many relation naming: pluralize the
             // singular form so an already-plural table name is not doubled
             // (e.g. `posts` -> `postsByAuthorId`, not `postsesByAuthorId`)
-            let rel_field_name = format!(
-                "{}By{}",
-                pluralize(&to_camel_case(&singularize(&other_table.name))),
-                to_pascal_case(&fk.columns[0]),
-            );
+            let rel_field_name =
+                has_many_field_name(&other_table.name, &fk.columns[0], &table.name);
             let pascal_rel_field = format!(
                 "{}By{}",
                 to_pascal_case(&pluralize(&singularize(&other_table.name))),
