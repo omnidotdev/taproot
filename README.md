@@ -45,17 +45,17 @@ taproot -c taproot.yaml
 
 ## Features
 
-- **Schema introspection** — tables, views, columns, primary keys, foreign keys, enums, composite types (a column named `id` is exposed as `rowId`)
-- **Relay pagination** — cursor connections with `first`/`after`/`last`/`before`/`offset`
-- **Global object identification** — every row carries an opaque Relay `nodeId`, refetchable through the `node(nodeId:)` root field
-- **Filtering** — a flat `condition` (equality) plus a rich `filter` with comparison, pattern, and array operators and `and`/`or`/`not`
-- **Mutations** — `create`/`update`/`delete`, bulk variants, and nested `create`/`connect` for related records
-- **Subscriptions** — real-time change notifications over Postgres `LISTEN`/`NOTIFY`
-- **Row-Level Security** — JWT-based auth with RLS passthrough to Postgres
-- **Apollo Federation** — expose tables as federated subgraph entities
-- **Plugin system** — `on_introspect`, `on_plan`, `filter_table`, plus `query_fields`/`mutation_fields` for custom SQL-backed root fields
-- **Smart comments** — `@omit`, `@name`, `@deprecated` annotations
-- **Embeddable** — use as a Rust library via `taproot-core`
+- **Schema introspection**: tables, views, columns, primary keys, foreign keys, enums, composite types (a column named `id` is exposed as `rowId`)
+- **Relay pagination**: cursor connections with `first`/`after`/`last`/`before`/`offset`
+- **Global object identification**: every row carries an opaque Relay `id`, refetchable through the `node(id:)` root field
+- **Filtering**: a flat `condition` (equality) plus a rich `filter` with comparison, pattern, and array operators and `and`/`or`/`not`
+- **Mutations**: `create`/`update`/`delete`, bulk variants, and nested `create`/`connect` for related records
+- **Subscriptions**: real-time change notifications over Postgres `LISTEN`/`NOTIFY`
+- **Row-Level Security**: JWT-based auth with RLS passthrough to Postgres
+- **Apollo Federation**: expose tables as federated subgraph entities
+- **Plugin system**: `on_introspect`, `on_plan`, `filter_table`, plus `query_fields`/`mutation_fields` for custom SQL-backed root fields
+- **Smart comments**: `@omit`, `@name`, `@deprecated` annotations
+- **Embeddable**: use as a Rust library via `taproot-core`
 
 See the [configuration reference](https://docs.omni.dev/products/taproot) for all options.
 
@@ -83,4 +83,4 @@ Full documentation is at [docs.omni.dev/products/taproot](https://docs.omni.dev/
 
 ## License
 
-Apache-2.0
+The code in this repository is licensed under Apache 2.0, &copy; [Omni LLC](https://omni.dev). See [LICENSE.md](LICENSE.md) for more information.
