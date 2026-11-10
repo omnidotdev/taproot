@@ -30,7 +30,7 @@ services:
         condition: service_healthy
 
   hasura:
-    image: hasura/graphql-engine:v2.42.0
+    image: hasura/graphql-engine:v2.51.5
     environment:
       HASURA_GRAPHQL_DATABASE_URL: "postgres://postgres:postgres@postgres:5432/bench"
       HASURA_GRAPHQL_ENABLE_CONSOLE: "false"
