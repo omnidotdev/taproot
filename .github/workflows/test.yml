@@ -31,7 +31,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/taproot_test
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         # The channel comes from rust-toolchain.toml (stable); add clippy
         run: rustup component add clippy
